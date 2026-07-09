@@ -432,8 +432,8 @@ def hunt_leads_via_places_api(niche: str, location: str) -> list:
         STATE.record_error("Missing API Key environment secret.")
         return []
 
-    # 1. Resolve text city name into geographic coordinates
-    geocode_url = f"https://api.geoapify.com/v1/geocode/search?text={location}&apiKey={api_key}"
+        # 1. Resolve text city name into geographic coordinates
+    geocode_url = f"https://api.geoapify.com/v1/geocode/search?text={html.escape(location)}&apiKey={api_key}"
     try:
         geo_res = requests.get(geocode_url, timeout=CONFIG.scrape_timeout_seconds)
         geo_data = geo_res.json()
@@ -447,27 +447,26 @@ def hunt_leads_via_places_api(niche: str, location: str) -> list:
         return []
 
     # 2. Query Geoapify Places near coordinates
-            places_url = "https://api.geoapify.com/v2/places"
-            params = {
-            "categories": "commercial,office,service",
-            "name": niche.split()[0], # Grab core keyword (e.g., "Roofing")
-            "filter": f"circle:{lon},{lat},15000", # Adjusted to 15km radius to prevent API timeouts
-            "limit": min(CONFIG.max_hunt_results, 50),
-            "apiKey": api_key
-        }
+    places_url = "https://api.geoapify.com/v2/places"
+    params = {
+        "categories": "commercial,office,service",
+        "name": niche.split()[0],
+        "filter": f"circle:{lon},{lat},15000",
+        "limit": min(CONFIG.max_hunt_results, 50),
+        "apiKey": api_key
+    }
 
-            try:
-        # Increased timeout to 20 seconds to give the API handshake plenty of time
-            response = requests.get(places_url, params=params, timeout=20)
-            if response.status_code != 200:
-                    logger.error(f"Geoapify API error: {response.status_code}")
-                    return []
+    try:
+        response = requests.get(places_url, params=params, timeout=20)
+        if response.status_code != 200:
+            logger.error(f"Geoapify API error: {response.status_code}")
+            return []
             
-            payload = response.json()
-        except Exception as exc:
+        payload = response.json()
+    except Exception as exc:
         logger.error(f"Geoapify request failed: {exc}")
         return []
-
+      
     features = payload.get("features", [])
     logger.info(f"Geoapify returned {len(features)} candidates for '{niche} in {location}'.")
 
