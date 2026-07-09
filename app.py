@@ -448,16 +448,17 @@ def hunt_leads_via_places_api(niche: str, location: str) -> list:
 
     # 2. Query Geoapify Places near coordinates
     places_url = "https://api.geoapify.com/v2/places"
-    params = {
+        params = {
         "categories": "commercial,office,service",
         "name": niche.split()[0], # Grab core keyword (e.g., "Roofing")
-        "filter": f"circle:{lon},{lat},50000", # 50km radius search area
+        "filter": f"circle:{lon},{lat},15000", # Adjusted to 15km radius to prevent API timeouts
         "limit": min(CONFIG.max_hunt_results, 50),
         "apiKey": api_key
     }
 
     try:
-        response = requests.get(places_url, params=params, timeout=CONFIG.scrape_timeout_seconds)
+        # Increased timeout to 20 seconds to give the API handshake plenty of time
+        response = requests.get(places_url, params=params, timeout=20)
         if response.status_code != 200:
             logger.error(f"Geoapify API error: {response.status_code}")
             return []
