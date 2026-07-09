@@ -449,7 +449,7 @@ def hunt_leads_via_places_api(niche: str, location: str) -> list:
     # 2. Query Geoapify Places near coordinates
     places_url = "https://api.geoapify.com/v2/places"
     params = {
-        "categories": "commercial,office,industrial",
+        "categories": "commercial,office,service",
         "name": niche.split()[0], # Grab core keyword (e.g., "Roofing")
         "filter": f"circle:{lon},{lat},50000", # 50km radius search area
         "limit": min(CONFIG.max_hunt_results, 50),
