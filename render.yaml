@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: growth-pulse-engine
+    runtime: python
+    plan: free
+    buildCommand: pip install --no-cache-dir -r requirements.txt
+    startCommand: python app.py
+    healthCheckPath: /
+    envVars:
+      - key: EMAIL_USER
+        sync: false
+      - key: EMAIL_PASS
+        sync: false
+      - key: GOOGLE_PLACES_API_KEY
+        sync: false
+      - key: SENDER_DISPLAY_NAME
+        value: Growth Pulse Solutions
+      - key: MAX_HUNT_RESULTS
+        value: "100" # Maximize the pull capacity per location branch
+      - key: LOOP_INTERVAL_SECONDS
+        value: "1800" # Increase frequency to process leads every 30 minutes
+
+      # --- GLOBAL TARGET MATRIX (HIGH-BUDGET METROS & HIGH-VALUE NICHES) ---
+      - key: AUTOMATED_NICHES
+        value: "Commercial Roofing, Solar Panel Installation, Custom Home Builders, Luxury Landscaping, Foundation Repair Contractors, HVAC Mechanical, Commercial Electricians, Swimming Pool Builders"
+      - key: AUTOMATED_CITIES
+        value: "New York NY, Los Angeles CA, Houston TX, Chicago IL, Miami FL, London UK, Toronto ON, Sydney Australia, Dubai UAE, Atlanta GA, Phoenix AZ, Dallas TX, Las Vegas NV"
+        
