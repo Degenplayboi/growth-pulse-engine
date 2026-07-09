@@ -967,49 +967,67 @@ def build_dashboard() -> gr.Blocks:
             dashboard.load(fn=get_dashboard_metrics, inputs=None, outputs=metric_outputs)
 
     return dashboard
-
-
-# ---------------------------------------------------------------------------
-# Entrypoint
-# ---------------------------------------------------------------------------
-
-STATE.set_status("Starting")
-_background_thread = threading.Thread(target=automation_loop, name="automation_loop", daemon=True)
-_background_thread.start()
-
-demo = build_dashboard()
-demo.queue()
+# ===========================================================================
+# THE ONLY ENTRYPOINT DATA BLOCK THAT SHOULD EXIST AT THE BOTTOM:
+# ===========================================================================
 
 if __name__ == "__main__":
-    demo.launch(
-        server_name="0.0.0.0",
-        server_port=int(os.environ.get("PORT", "7860")),
-        ssr_mode=False,
-    )
-if __name__ == "__main__":
-    # --- AUTOPILOT TARGET HUNT BOOTSTRAPPER ---
+    # --- ENTERPRISE AUTOMATION TARGET PIPELINE ---
     target_niches = os.environ.get("AUTOMATED_NICHES", "")
     target_cities = os.environ.get("AUTOMATED_CITIES", "")
     
     if target_niches and target_cities:
-        logger.info("Autopilot triggered. Generating automated global hunting lists...")
+        logger.info("Initializing high-capacity global market acquisition run...")
         niches = [n.strip() for n in target_niches.split(",") if n.strip()]
         cities = [c.strip() for c in target_cities.split(",") if c.strip()]
         
-        # Build a fresh leads queue by hunting these parameters automatically via Places API
-        with open(CONFIG.leads_queue_path, "w", encoding="utf-8", newline="") as h:
-            writer = csv.writer(h)
-            writer.writerow(["domain", "contact_email"]) # Headers required by your loop
-            
+        def background_hunting_pipeline():
+            logger.info("Background scouting thread fully engaged. Commencing global harvesting loop.")
             for niche in niches:
                 for city in cities:
-                    logger.info(f"Background scouting: Harvesting {niche} in {city}...")
-                    found = hunt_leads_via_places_api(niche, city)
-                    for lead in found:
-                        # Pre-populate the queue for your background worker thread loop
-                        writer.writerow([lead["domain"], ""]) 
-        logger.info("Automated queue generation complete. Background thread engine engaging.")
-    # ------------------------------------------
+                    logger.info(f"Scanning Global Sector: Harvesting [{niche}] across [{city}]...")
+                    found_leads = hunt_leads_via_places_api(niche, city)
+                    
+                    if not found_leads:
+                        continue
+                        
+                    for lead in found_leads:
+                        domain = lead["domain"]
+                        
+                        if STORAGE.already_contacted(domain) or DEDUP.is_processed(domain):
+                            continue
+                            
+                        scrape_result = scrape_domain(domain)
+                        has_pixel = bool(scrape_result["has_meta_pixel"] or scrape_result["has_google_ads_tag"])
+                        STATE.record_lead_scraped(has_pixel)
+                        
+                        contact_email = scrape_result.get("contact_email")
+                        phone_number = scrape_result.get("phone_number") or lead.get("phone_number_from_places")
+                        
+                        STORAGE.save_lead(
+                            domain=domain,
+                            business_name=lead["business_name"],
+                            contact_email=contact_email,
+                            phone_number=phone_number,
+                            has_meta_pixel=scrape_result["has_meta_pixel"],
+                            has_google_ads_tag=scrape_result["has_google_ads_tag"],
+                            scrape_status=scrape_result["status"],
+                            source="automated_hunt",
+                        )
+                        DEDUP.mark_processed(domain)
+                        
+                        if scrape_result["status"] == "success" and contact_email:
+                            outcome = send_email_with_retry(
+                                contact_email, domain, lead["business_name"],
+                                scrape_result["has_meta_pixel"], scrape_result["has_google_ads_tag"]
+                            )
+                            STORAGE.mark_email_sent(domain, contact_email, outcome)
+                            
+                    time.sleep(5)
+            logger.info("All global sector sweeps completed successfully. Standing by for next maintenance schedule.")
+
+        hunt_worker = threading.Thread(target=background_hunting_pipeline, name="GlobalHunterThread", daemon=True)
+        hunt_worker.start()
 
     demo = build_dashboard()
     demo.queue()
@@ -1017,5 +1035,5 @@ if __name__ == "__main__":
         server_name="0.0.0.0",
         server_port=int(os.environ.get("PORT", "7860")),
         ssr_mode=False,
-    )
-  
+                            )
+              
