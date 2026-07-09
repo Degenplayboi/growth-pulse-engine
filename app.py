@@ -400,20 +400,10 @@ class StorageBackend:
 
 STORAGE = StorageBackend(CONFIG)
 
+ 
 # ---------------------------------------------------------------------------
-# Component A: Hunt layer — official Google Places API (New Places API v1)
+# Component A: Hunt layer — Geoapify Places API (Cardless Engine)
 # ---------------------------------------------------------------------------
-
-PLACES_SEARCH_TEXT_URL = "https://places.googleapis.com/v1/places:searchText"
-
-PLACES_FIELD_MASK = (
-    "places.displayName,"
-    "places.websiteUri,"
-    "places.formattedAddress,"
-    "places.nationalPhoneNumber,"
-    "places.internationalPhoneNumber"
-)
-
 
 def is_aggregator_domain(domain: str) -> bool:
     lowered = domain.lower()
@@ -431,82 +421,68 @@ def extract_domain_from_url(url: str) -> Optional[str]:
 
 def hunt_leads_via_places_api(niche: str, location: str) -> list:
     """
-    Queries the official Google Places API (New) Text Search endpoint
-    (POST https://places.googleapis.com/v1/places:searchText) for
-    businesses matching the given niche and location. Requests
-    displayName, websiteUri, formattedAddress, and phone number fields
-    directly in a single call via the X-Goog-FieldMask header, with no
-    separate Place Details round trip required. Filters out results with
-    no independent website and results whose website belongs to a known
-    aggregator/directory domain. Returns a list of dicts:
-    {business_name, domain, formatted_address, phone_number_from_places}.
+    Queries the Geoapify Places API to discover local businesses globally.
+    Requires ZERO credit cards. Automatically geocodes the target city 
+    and harvests matching commercial nodes, extracting names, websites, 
+    and contact details.
     """
-    if not CONFIG.google_places_api_key:
-        logger.error("GOOGLE_PLACES_API_KEY is not set. Cannot run the hunt layer.")
-        STATE.record_error("Missing GOOGLE_PLACES_API_KEY environment secret.")
+    api_key = os.environ.get("GOOGLE_PLACES_API_KEY") # Kept the same env name so your YAML works
+    if not api_key:
+        logger.error("API Key is not set. Cannot run the hunt layer.")
+        STATE.record_error("Missing API Key environment secret.")
         return []
 
-    query_text = f"{niche} in {location}"
+    # 1. Resolve text city name into geographic coordinates
+    geocode_url = f"https://api.geoapify.com/v1/geocode/search?text={location}&apiKey={api_key}"
+    try:
+        geo_res = requests.get(geocode_url, timeout=CONFIG.scrape_timeout_seconds)
+        geo_data = geo_res.json()
+        if not geo_data.get("features"):
+            logger.error(f"Could not resolve location: {location}")
+            return []
+        
+        lon, lat = geo_data["features"][0]["geometry"]["coordinates"]
+    except Exception as exc:
+        logger.error(f"Geocoding failed for {location}: {exc}")
+        return []
 
-    request_headers = {
-        "Content-Type": "application/json",
-        "X-Goog-Api-Key": CONFIG.google_places_api_key,
-        "X-Goog-FieldMask": PLACES_FIELD_MASK,
-    }
-    request_body = {
-        "textQuery": query_text,
-        "maxResultCount": min(CONFIG.max_hunt_results, 20),
+    # 2. Query Geoapify Places near coordinates
+    places_url = "https://api.geoapify.com/v2/places"
+    params = {
+        "categories": "commercial,office,industrial",
+        "name": niche.split()[0], # Grab core keyword (e.g., "Roofing")
+        "filter": f"circle:{lon},{lat},50000", # 50km radius search area
+        "limit": min(CONFIG.max_hunt_results, 50),
+        "apiKey": api_key
     }
 
     try:
-        response = requests.post(
-            PLACES_SEARCH_TEXT_URL,
-            headers=request_headers,
-            json=request_body,
-            timeout=CONFIG.scrape_timeout_seconds,
-        )
-    except requests.exceptions.RequestException as exc:
-        logger.error("Places Text Search request failed: %s", exc)
-        STATE.record_error(f"Places Text Search request failed: {exc}")
-        return []
-
-    if response.status_code != 200:
-        try:
-            error_payload = response.json()
-            error_message = error_payload.get("error", {}).get("message", response.text)
-        except ValueError:
-            error_message = response.text
-        logger.error("Places Text Search API error (HTTP %d): %s", response.status_code, error_message)
-        STATE.record_error(f"Places Text Search API error (HTTP {response.status_code}): {error_message}")
-        return []
-
-    try:
+        response = requests.get(places_url, params=params, timeout=CONFIG.scrape_timeout_seconds)
+        if response.status_code != 200:
+            logger.error(f"Geoapify API error: {response.status_code}")
+            return []
+            
         payload = response.json()
-    except ValueError as exc:
-        logger.error("Places Text Search returned invalid JSON: %s", exc)
-        STATE.record_error(f"Places Text Search invalid JSON: {exc}")
+    except Exception as exc:
+        logger.error(f"Geoapify request failed: {exc}")
         return []
 
-    places = payload.get("places", [])
-    logger.info("Places Text Search (New API) returned %d candidate(s) for '%s'.", len(places), query_text)
+    features = payload.get("features", [])
+    logger.info(f"Geoapify returned {len(features)} candidates for '{niche} in {location}'.")
 
     candidates = []
-    for place in places:
-        display_name_block = place.get("displayName", {})
-        business_name = display_name_block.get("text", "").strip()
-        website_uri = place.get("websiteUri")
-        formatted_address = place.get("formattedAddress", "")
-        phone_from_places = place.get("nationalPhoneNumber") or place.get("internationalPhoneNumber")
+    for feature in features:
+        props = feature.get("properties", {})
+        business_name = props.get("name")
+        website_uri = props.get("website")
+        formatted_address = props.get("formatted")
+        phone_from_places = props.get("phone")
 
         if not business_name or not website_uri:
             continue
 
         domain = extract_domain_from_url(website_uri)
-        if not domain:
-            continue
-        if is_aggregator_domain(domain):
-            continue
-        if DEDUP.is_processed(domain):
+        if not domain or is_aggregator_domain(domain) or DEDUP.is_processed(domain):
             continue
 
         candidates.append({
@@ -516,9 +492,8 @@ def hunt_leads_via_places_api(niche: str, location: str) -> list:
             "phone_number_from_places": phone_from_places,
         })
 
-    logger.info("Hunt layer yielded %d new, non-aggregator candidate(s) with independent websites.", len(candidates))
     return candidates
-
+  
 # ---------------------------------------------------------------------------
 # Component B: Scraper + pixel verifier + contact extractor
 # ---------------------------------------------------------------------------
