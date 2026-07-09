@@ -42,6 +42,7 @@ from typing import Optional
 import requests
 import gradio as gr
 import pandas as pd
+import html
 
 # ---------------------------------------------------------------------------
 # Logging
