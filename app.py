@@ -986,3 +986,36 @@ if __name__ == "__main__":
         server_port=int(os.environ.get("PORT", "7860")),
         ssr_mode=False,
     )
+if __name__ == "__main__":
+    # --- AUTOPILOT TARGET HUNT BOOTSTRAPPER ---
+    target_niches = os.environ.get("AUTOMATED_NICHES", "")
+    target_cities = os.environ.get("AUTOMATED_CITIES", "")
+    
+    if target_niches and target_cities:
+        logger.info("Autopilot triggered. Generating automated global hunting lists...")
+        niches = [n.strip() for n in target_niches.split(",") if n.strip()]
+        cities = [c.strip() for c in target_cities.split(",") if c.strip()]
+        
+        # Build a fresh leads queue by hunting these parameters automatically via Places API
+        with open(CONFIG.leads_queue_path, "w", encoding="utf-8", newline="") as h:
+            writer = csv.writer(h)
+            writer.writerow(["domain", "contact_email"]) # Headers required by your loop
+            
+            for niche in niches:
+                for city in cities:
+                    logger.info(f"Background scouting: Harvesting {niche} in {city}...")
+                    found = hunt_leads_via_places_api(niche, city)
+                    for lead in found:
+                        # Pre-populate the queue for your background worker thread loop
+                        writer.writerow([lead["domain"], ""]) 
+        logger.info("Automated queue generation complete. Background thread engine engaging.")
+    # ------------------------------------------
+
+    demo = build_dashboard()
+    demo.queue()
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=int(os.environ.get("PORT", "7860")),
+        ssr_mode=False,
+    )
+  
