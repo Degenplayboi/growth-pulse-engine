@@ -656,40 +656,54 @@ def build_outreach_message(sender_email: str, recipient_email: str, domain: str,
     message.attach(MIMEText(text_body, "plain"))
     return message
 
+import requests
+import os
 
-def send_email_with_retry(recipient_email: str, domain: str, business_name: str,
-                           has_meta_pixel: bool, has_google_ads_tag: bool) -> str:
-    if not CONFIG.email_user or not CONFIG.email_pass:
-        logger.error("EMAIL_USER / EMAIL_PASS are not set in the environment. Cannot dispatch email.")
-        STATE.record_error("Missing EMAIL_USER/EMAIL_PASS environment secrets.")
+def send_email_with_retry(recipient_email, domain, business_name, has_meta_pixel, max_retries=3):
+    api_key = os.environ.get("BREVO_API_KEY")
+    sender_email = os.environ.get("EMAIL_USER") # Your Gmail address
+    
+    if not api_key or not sender_email:
+        logger.error("Missing BREVO_API_KEY or EMAIL_USER environment variable.")
         return "failed"
-
-    message = build_outreach_message(
-        CONFIG.email_user, recipient_email, domain, business_name, has_meta_pixel, has_google_ads_tag
-    )
-    ssl_context = ssl.create_default_context()
-
-    for retry_count in range(CONFIG.max_retries):
+        
+    url = "https://api.brevo.com/v3/smtp/email"
+    headers = {
+        "accept": "application/json",
+        "api-key": api_key,
+        "content-type": "application/json"
+    }
+    
+    # Custom automated outreach pitch matching your high-ticket niches
+    html_body = f"""
+    <p>Hi {business_name},</p>
+    <p>I was looking over your website at <strong>{domain}</strong> and noticed a massive opportunity to optimize your customer acquisition framework.</p>
+    <p>We specialize in helping premium local operations scale their revenue. Let me know if you have 5 minutes for a brief breakdown.</p>
+    <p>Best regards,<br>Growth Pulse Engine</p>
+    """
+    
+    payload = {
+        "sender": {{"name": "Acquisition Team", "email": sender_email}},
+        "to": [{{"email": recipient_email}}],
+        "subject": f"Growth Strategy for {business_name}",
+        "htmlContent": html_body
+    }
+    
+    for attempt in range(max_retries):
         try:
-            with smtplib.SMTP_SSL(CONFIG.smtp_host, CONFIG.smtp_port, context=ssl_context, timeout=15) as server:
-                server.login(CONFIG.email_user, CONFIG.email_pass)
-                server.sendmail(CONFIG.email_user, recipient_email, message.as_string())
-            logger.info("Email sent to %s for domain %s on attempt %d", recipient_email, domain, retry_count + 1)
-            STATE.record_email_sent()
-            return "success"
-        except smtplib.SMTPAuthenticationError as exc:
-            logger.error("SMTP authentication failed: %s", exc)
-            STATE.record_error(f"SMTP auth failure: {exc}")
-            return "failed"
-        except (smtplib.SMTPException, OSError) as exc:
-            wait_seconds = 2 ** retry_count
-            logger.warning("SMTP send attempt %d/%d for %s failed (%s). Retrying in %d seconds.", retry_count + 1, CONFIG.max_retries, recipient_email, exc, wait_seconds)
-            STATE.record_error(f"SMTP transient failure: {exc}")
-            time.sleep(wait_seconds)
-
-    logger.error("All %d SMTP attempts failed for %s.", CONFIG.max_retries, recipient_email)
+            response = requests.post(url, json=payload, headers=headers, timeout=10)
+            if response.status_code in [200, 201, 202]:
+                logger.info(f"Email successfully dispatched to {recipient_email} via Brevo API")
+                STATE.record_email_sent()
+                return "success"
+            else:
+                logger.warning(f"Brevo API returned status code {response.status_code}: {response.text}")
+        except Exception as e:
+            logger.warning(f"Brevo delivery attempt {attempt + 1} failed: {str(e)}")
+            
+    STATE.record_error("Brevo API delivery exhausted all retries.")
     return "failed"
-
+                            
 # ---------------------------------------------------------------------------
 # Lead queue reader (existing passive background loop)
 # ---------------------------------------------------------------------------
