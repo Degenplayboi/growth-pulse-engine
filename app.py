@@ -458,7 +458,7 @@ def hunt_leads_via_places_api(niche: str, location: str) -> list:
     }
 
     try:
-        response = requests.get(places_url, params=params, timeout=20)
+        response = requests.get(places_url, params=params, timeout=30)
         if response.status_code != 200:
             logger.error(f"Geoapify API error: {response.status_code}")
             return []
