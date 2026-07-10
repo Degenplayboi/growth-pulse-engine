@@ -659,7 +659,7 @@ def build_outreach_message(sender_email: str, recipient_email: str, domain: str,
 import requests
 import os
 
-def send_email_with_retry(recipient_email, domain, business_name, has_meta_pixel, max_retries=3):
+def send_email_with_retry(recipient_email, domain, business_name, has_meta_pixel, has_google_ads_tag, max_retries=3):
     api_key = os.environ.get("BREVO_API_KEY")
     sender_email = os.environ.get("EMAIL_USER") # Your Gmail address
     
@@ -683,8 +683,8 @@ def send_email_with_retry(recipient_email, domain, business_name, has_meta_pixel
     """
     
     payload = {
-        "sender": {{"name": "Acquisition Team", "email": sender_email}},
-        "to": [{{"email": recipient_email}}],
+        "sender": {"name": "Acquisition Team", "email": sender_email},
+        "to": [{"email": recipient_email}],
         "subject": f"Growth Strategy for {business_name}",
         "htmlContent": html_body
     }
