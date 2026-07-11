@@ -82,6 +82,10 @@ class Config:
     loop_interval_seconds: int = int(os.environ.get("LOOP_INTERVAL_SECONDS", "300"))
     max_retries: int = 3
     max_hunt_results: int = int(os.environ.get("MAX_HUNT_RESULTS", "20"))
+    # IMPROVED: Daily email sending cap to stay within free tier limits and prevent over-sending.
+    daily_email_cap: int = int(os.environ.get("DAILY_EMAIL_CAP", "180")) # IMPROVED:
+    # IMPROVED: Small delay between email sends to avoid hitting API rate limits and appear more natural.
+    email_send_delay_seconds: int = int(os.environ.get("EMAIL_SEND_DELAY_SECONDS", "5")) # IMPROVED:
 
     user_agent: str = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -124,6 +128,7 @@ class EngineState:
         self._lock = threading.Lock()
         self.status: str = "Idle"
         self.emails_dispatched_today: int = 0
+        self.email_cap_reached_today: bool = False # IMPROVED: Track if daily email cap is reached
         self.leads_scraped_total: int = 0
         self.leads_with_pixel_total: int = 0
         self.errors_total: int = 0
@@ -136,6 +141,7 @@ class EngineState:
         today = date.today()
         if today != self._counter_date:
             self.emails_dispatched_today = 0
+            self.email_cap_reached_today = False # IMPROVED: Reset cap status daily
             self._counter_date = today
 
     def set_status(self, status: str) -> None:
@@ -159,7 +165,12 @@ class EngineState:
     def record_email_sent(self) -> None:
         with self._lock:
             self._roll_daily_counter_if_needed()
-            self.emails_dispatched_today += 1
+            if self.emails_dispatched_today < CONFIG.daily_email_cap: # IMPROVED: Enforce daily cap
+                self.emails_dispatched_today += 1
+                self.email_cap_reached_today = False
+            else:
+                self.email_cap_reached_today = True # IMPROVED: Mark cap as reached
+                logger.warning("IMPROVED: Daily email dispatch cap reached. No more emails will be sent today.")
 
     def record_error(self, message: str) -> None:
         with self._lock:
@@ -172,6 +183,7 @@ class EngineState:
             return {
                 "status": self.status,
                 "emails_dispatched_today": self.emails_dispatched_today,
+                "email_cap_reached_today": self.email_cap_reached_today, # IMPROVED: Expose cap status
                 "leads_scraped_total": self.leads_scraped_total,
                 "leads_with_pixel_total": self.leads_with_pixel_total,
                 "errors_total": self.errors_total,
@@ -682,19 +694,59 @@ def send_email_with_retry(recipient_email, domain, business_name, has_meta_pixel
     <p>Best regards,<br>Growth Pulse Engine</p>
     """
     
+    # IMPROVED: Add Reply-To header for better deliverability and direct responses.
+    reply_to_email = os.environ.get("REPLY_TO_EMAIL", sender_email) # IMPROVED: Configurable Reply-To
+
+    # IMPROVED: Highly personalized email template with strong CTA.
+    # This template leverages the ad tracking findings for a more targeted pitch.
+    if not has_meta_pixel and not has_google_ads_tag:
+        subject = f"[Action Required] {business_name}: Missing Critical Ad Tracking"
+        personalization_line = (
+            f"I noticed your website, {domain}, is missing both Meta Pixel and Google Ads tracking. "
+            f"This means you're likely spending money on ads without knowing which ones are actually converting into customers."
+        )
+    elif not has_meta_pixel:
+        subject = f"[Urgent] {business_name}: Optimize Your Meta Ad Spend"
+        personalization_line = (
+            f"I saw your website, {domain}, has Google Ads tracking, but no Meta Pixel. "
+            f"This is a huge missed opportunity for retargeting and accurate attribution from Facebook/Instagram campaigns."
+        )
+    else:
+        subject = f"[Critical] {business_name}: Boost Your Google Ads ROI"
+        personalization_line = (
+            f"I observed your website, {domain}, has Meta Pixel, but lacks Google Ads conversion tracking. "
+            f"Without this, it's impossible to truly optimize your Google Ads for maximum return on investment."
+        )
+
+    html_body = f"""
+    <p>Hi {business_name},</p>
+    <p>{personalization_line}</p>
+    <p>We specialize in helping businesses like yours fix these critical gaps, turning ad spend into predictable revenue.</p>
+    <p>Would you be open to a brief 15-minute call next week to discuss how we can help you implement a robust tracking system that directly impacts your bottom line?</p>
+    <p>Simply reply with <strong>"YES"</strong> to schedule a quick chat.</p>
+    <p>Best regards,<br>The Growth Pulse Team</p>
+    """
+
     payload = {
-        "sender": {"name": "Acquisition Team", "email": sender_email},
+        "sender": {"name": CONFIG.sender_display_name, "email": sender_email},
         "to": [{"email": recipient_email}],
-        "subject": f"Growth Strategy for {business_name}",
+        "replyTo": {"email": reply_to_email}, # IMPROVED: Added Reply-To header
+        "subject": subject,
         "htmlContent": html_body
     }
     
+    # IMPROVED: Check daily email cap before attempting to send.
+    if STATE.email_cap_reached_today:
+        logger.warning(f"IMPROVED: Skipping email to {recipient_email} as daily cap of {CONFIG.daily_email_cap} has been reached.")
+        return "skipped_cap_reached"
+
     for attempt in range(max_retries):
         try:
             response = requests.post(url, json=payload, headers=headers, timeout=10)
             if response.status_code in [200, 201, 202]:
                 logger.info(f"Email successfully dispatched to {recipient_email} via Brevo API")
                 STATE.record_email_sent()
+                time.sleep(CONFIG.email_send_delay_seconds) # IMPROVED: Small delay between sends
                 return "success"
             else:
                 logger.warning(f"Brevo API returned status code {response.status_code}: {response.text}")
@@ -901,6 +953,7 @@ def get_dashboard_metrics():
         snapshot["last_cycle_started_at"] or "Not yet run",
         snapshot["last_cycle_completed_at"] or "Not yet run",
         snapshot["last_error"] or "None",
+        "Yes" if snapshot["email_cap_reached_today"] else "No", # IMPROVED: Display daily cap status
     )
 
 
@@ -935,6 +988,7 @@ def build_dashboard() -> gr.Blocks:
             with gr.Row():
                 status_box = gr.Textbox(label="Engine Status", interactive=False)
                 errors_box = gr.Number(label="Errors Total", interactive=False)
+                email_cap_status_box = gr.Textbox(label="Daily Email Cap Reached", interactive=False) # IMPROVED: Display daily cap status
 
             with gr.Row():
                 emails_box = gr.Number(label="Emails Dispatched Today", interactive=False)
@@ -950,7 +1004,7 @@ def build_dashboard() -> gr.Blocks:
 
             metric_outputs = [
                 status_box, emails_box, leads_box, pixel_box,
-                errors_box, started_box, completed_box, last_error_box,
+                errors_box, started_box, completed_box, last_error_box, email_cap_status_box, # IMPROVED: Add cap status to outputs
             ]
 
             refresh_button.click(fn=get_dashboard_metrics, inputs=None, outputs=metric_outputs)
