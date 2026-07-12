@@ -1642,7 +1642,8 @@ if __name__ == "__main__":
     # still worked (Gradio kept it backward-compatible with a warning), but
     # fixing it now avoids relying on that compatibility shim staying around.
     build_ui().launch(
-        server_name="0.0.0.0", server_port=7860,
+        server_name="0.0.0.0", 
+        server_port=7860,
         theme=gr.themes.Soft(primary_hue="blue", secondary_hue="slate"),
         css=CARD_CSS,
-  )
+    )
