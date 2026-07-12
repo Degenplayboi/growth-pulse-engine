@@ -576,7 +576,7 @@ def build_ui():
                 status_box = gr.JSON(label="Vital Signs", value=STATE.snapshot())
         results_table = gr.DataFrame(label="Live Beast Stream")
         hunt_btn.click(run_autonomous_hunt, inputs=[niche_input, loc_input], outputs=[results_table, status_box])
-        demo.load(lambda: STATE.snapshot(), outputs=status_box, every=5)
+        demo.load(lambda: STATE.snapshot(), outputs=status_box)
     return demo
 
 if __name__ == "__main__":
