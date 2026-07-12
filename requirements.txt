@@ -1,5 +1,5 @@
 requests
-gradio>=4.44
+gradio>=4.44,<7
 pandas
 dnspython
 tzdata
