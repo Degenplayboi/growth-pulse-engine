@@ -106,7 +106,16 @@ class Config:
     brevo_api_key: Optional[str] = field(default_factory=lambda: os.environ.get("BREVO_API_KEY"))
     sender_display_name: str = field(default_factory=lambda: os.environ.get("SENDER_DISPLAY_NAME", "Growth Pulse"))
 
+    # IMPROVED: Google Places replaced with Geoapify. Kept the old field so
+    # nothing breaks if it's still set, but it is no longer read anywhere.
     google_places_api_key: Optional[str] = field(default_factory=lambda: os.environ.get("GOOGLE_PLACES_API_KEY"))
+    geoapify_api_key: Optional[str] = field(default_factory=lambda: os.environ.get("GEOAPIFY_API_KEY"))
+    # IMPROVED: Geoapify's free tier is quota-limited per day across
+    # geocode+places+details combined; this caps our own usage well under
+    # that so a single hunt cycle can't burn the day's quota by calling
+    # Place Details once per candidate. Defaults conservative on purpose.
+    geoapify_daily_call_cap: int = int(os.environ.get("GEOAPIFY_DAILY_CALL_CAP", "2500"))
+    geoapify_details_per_cycle: int = int(os.environ.get("GEOAPIFY_DETAILS_PER_CYCLE", "15"))
     telegram_bot_token: Optional[str] = field(default_factory=lambda: os.environ.get("TELEGRAM_BOT_TOKEN"))
     telegram_chat_id: Optional[str] = field(default_factory=lambda: os.environ.get("TELEGRAM_CHAT_ID"))
 
@@ -351,12 +360,17 @@ class EngineState:
         self.last_error: Optional[str] = None
         self.current_niche_city_index: int = 0
         self._counter_date: date = date.today()
+        # IMPROVED: Geoapify free-tier daily quota tracking.
+        self.geoapify_calls_today: int = 0
+        self.geoapify_cap_reached_today: bool = False
 
     def _roll_daily_counter_if_needed(self) -> None:
         today = date.today()
         if today != self._counter_date:
             self.emails_dispatched_today = 0
             self.email_cap_reached_today = False
+            self.geoapify_calls_today = 0
+            self.geoapify_cap_reached_today = False
             self._counter_date = today
 
     def set_status(self, status: str) -> None:
@@ -391,6 +405,18 @@ class EngineState:
             if self.emails_dispatched_today >= self.todays_cap():
                 self.email_cap_reached_today = True
 
+    def try_reserve_geoapify_call(self) -> bool:
+        """IMPROVED: gate every Geoapify request through here so a single
+        hunt cycle can't burn the day's free-tier quota. Returns False once
+        the daily cap is hit; callers fall back to the DDG discovery path."""
+        with self._lock:
+            self._roll_daily_counter_if_needed()
+            if self.geoapify_calls_today >= CONFIG.geoapify_daily_call_cap:
+                self.geoapify_cap_reached_today = True
+                return False
+            self.geoapify_calls_today += 1
+            return True
+
     def snapshot(self) -> dict:
         with self._lock:
             self._roll_daily_counter_if_needed()
@@ -401,6 +427,8 @@ class EngineState:
                 "email_cap_reached_today": self.email_cap_reached_today,
                 "leads_scraped_total": self.leads_scraped_total,
                 "leads_with_pixel_total": self.leads_with_pixel_total,
+                "geoapify_calls_today": self.geoapify_calls_today,
+                "geoapify_cap_reached_today": self.geoapify_cap_reached_today,
                 "errors_total": self.errors_total,
                 "last_cycle_started_at": self.last_cycle_started_at,
                 "last_cycle_completed_at": self.last_cycle_completed_at,
@@ -621,7 +649,7 @@ def backup_loop() -> None:
             backup_sync_now()
         except Exception as exc:
             STATE.record_error(f"Backup loop error: {exc}")
-
+      
 # ---------------------------------------------------------------------------
 # IMPROVED: Search intelligence — DuckDuckGo HTML-lite instead of raw Google
 # Google's public search HTML returns a CAPTCHA/consent wall to almost any
@@ -659,6 +687,318 @@ def free_web_search(query: str) -> str:
 def is_junk_email(addr: str) -> bool:
     lowered = addr.lower()
     return any(marker in lowered for marker in CONFIG.junk_email_markers)
+
+
+# ---------------------------------------------------------------------------
+# IMPROVED: Hunt layer — Geoapify Places (replaces Google Places).
+# ---------------------------------------------------------------------------
+# Two real constraints, not hidden behind the abstraction:
+#  1. Geoapify's Places API is category-based (fixed OSM taxonomy), not a
+#     free-text business search like Google's textQuery. Checked against the
+#     actual AUTOMATED_NICHES list: only "Commercial Electricians" maps to a
+#     real category (service.electrician). Roofing, solar installers, custom
+#     home builders, landscaping, foundation repair, and HVAC have no
+#     matching category — OSM doesn't tag these as a business type at all.
+#  2. Even where a category matches, Geoapify's documented Places response
+#     has no website field, and a follow-up Place Details lookup only
+#     surfaces one if OSM happens to have a contact:website tag — sparse for
+#     small local contractors.
+# NICHE_CATEGORY_MAP holds only the mappings that are genuinely solid.
+# Everything else — and anything a mapped category fails to return a usable
+# website for — falls through to a DuckDuckGo business-discovery search
+# (ddg_business_discovery), reusing the same rate-limited search path as the
+# founder/competitor lookups. This keeps the system 100% free and running
+# unattended, but it is a lower-precision source than a real places API;
+# watch geoapify_calls_today / leads_scraped_total on the dashboard to see
+# which niches are actually producing candidates.
+# ---------------------------------------------------------------------------
+
+NICHE_CATEGORY_MAP: Dict[str, str] = {
+    "electrician": "service.electrician",
+    "electrical": "service.electrician",
+}
+
+# IMPROVED: raw OpenStreetMap "craft=" tags cover a few trades that Geoapify's
+# curated category list doesn't expose at all (Geoapify wraps OSM but only
+# surfaces a subset of tags as categories). Querying OSM directly via the
+# free Overpass API reaches these without spending Geoapify's daily credits.
+# Real caveat, stated plainly: OSM's coverage of solo-operator trade
+# businesses (no storefront) is generally sparse — this widens the net, it
+# doesn't fill it. Foundation repair and solar installers still have no
+# reasonable OSM tag and go straight to DDG discovery.
+OVERPASS_NICHE_TAGS: Dict[str, List[Tuple[str, str]]] = {
+    "roofing": [("craft", "roofer")],
+    "roofer": [("craft", "roofer")],
+    "electrician": [("craft", "electrician")],
+    "electrical": [("craft", "electrician")],
+    "hvac": [("craft", "hvac")],
+    "landscap": [("craft", "gardener")],
+    "builder": [("craft", "builder")],
+    "home builder": [("craft", "builder")],
+}
+
+_geocode_cache: Dict[str, Optional[dict]] = {}
+_geocode_lock = threading.Lock()
+
+
+def map_niche_to_category(niche: str) -> Optional[str]:
+    lowered = niche.lower()
+    for key, category in NICHE_CATEGORY_MAP.items():
+        if key in lowered:
+            return category
+    return None
+
+
+def map_niche_to_overpass_tags(niche: str) -> List[Tuple[str, str]]:
+    lowered = niche.lower()
+    tags: List[Tuple[str, str]] = []
+    for key, tag_list in OVERPASS_NICHE_TAGS.items():
+        if key in lowered:
+            for tag in tag_list:
+                if tag not in tags:
+                    tags.append(tag)
+    return tags
+
+
+def geoapify_geocode_record(location: str) -> Optional[dict]:
+    """Resolves a city string to {"place_id":..., "lat":..., "lon":...},
+    cached for the life of the process so repeated hunt cycles don't
+    re-geocode the same city. Backs both the Geoapify Places filter and the
+    Overpass "around" radius query."""
+    with _geocode_lock:
+        if location in _geocode_cache:
+            return _geocode_cache[location]
+    if not CONFIG.geoapify_api_key or not STATE.try_reserve_geoapify_call():
+        return None
+    try:
+        resp = SESSION.get(
+            "https://api.geoapify.com/v1/geocode/search",
+            params={"text": location, "type": "city", "format": "json", "apiKey": CONFIG.geoapify_api_key},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+        record = None
+        if results:
+            record = {
+                "place_id": results[0].get("place_id"),
+                "lat": results[0].get("lat"),
+                "lon": results[0].get("lon"),
+            }
+        with _geocode_lock:
+            _geocode_cache[location] = record
+        return record
+    except (requests.RequestException, ValueError, IndexError, KeyError) as exc:
+        STATE.record_error(f"Geoapify geocode failed for '{location}': {exc}")
+        return None
+
+
+def geoapify_geocode_city(location: str) -> Optional[str]:
+    record = geoapify_geocode_record(location)
+    return record.get("place_id") if record else None
+
+
+def _find_website_in_json(node) -> Optional[str]:
+    """Best-effort recursive search for a website-shaped value anywhere in a
+    Place Details response — Geoapify only surfaces contact:website when OSM
+    happens to have it tagged, and the exact key path isn't guaranteed."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if isinstance(value, str) and "website" in key.lower() and value.startswith("http"):
+                return value
+            found = _find_website_in_json(value)
+            if found:
+                return found
+    elif isinstance(node, list):
+        for item in node:
+            found = _find_website_in_json(item)
+            if found:
+                return found
+    return None
+
+
+def geoapify_place_website(place_id: str) -> Optional[str]:
+    if not place_id or not CONFIG.geoapify_api_key or not STATE.try_reserve_geoapify_call():
+        return None
+    try:
+        resp = SESSION.get(
+            "https://api.geoapify.com/v2/place-details",
+            params={"id": place_id, "features": "details", "apiKey": CONFIG.geoapify_api_key},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return _find_website_in_json(resp.json())
+    except (requests.RequestException, ValueError) as exc:
+        STATE.record_error(f"Geoapify place-details failed for {place_id}: {exc}")
+        return None
+
+
+def geoapify_places_search(category: str, location: str, limit: int) -> List[Dict]:
+    place_id = geoapify_geocode_city(location)
+    if not place_id or not STATE.try_reserve_geoapify_call():
+        return []
+    try:
+        resp = SESSION.get(
+            "https://api.geoapify.com/v2/places",
+            params={
+                "categories": category,
+                "filter": f"place:{place_id}",
+                "limit": limit,
+                "apiKey": CONFIG.geoapify_api_key,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        features = resp.json().get("features", [])
+        return [
+            {"name": f["properties"].get("name"), "place_id": f["properties"].get("place_id")}
+            for f in features if f.get("properties", {}).get("name")
+        ]
+    except (requests.RequestException, ValueError, KeyError) as exc:
+        STATE.record_error(f"Geoapify places search failed for {category}/{location}: {exc}")
+        return []
+
+
+DDG_RESULT_RE = re.compile(
+    r'<a rel="nofollow" href="[^"]*uddg=([^&"]+)[^"]*"[^>]*class="result__a"[^>]*>(.*?)</a>',
+    re.IGNORECASE | re.DOTALL,
+)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def extract_ddg_results(html: str) -> List[Tuple[str, str]]:
+    """Returns (business_name, absolute_url) pairs from a DuckDuckGo
+    html-lite results page."""
+    from urllib.parse import unquote
+    out = []
+    for encoded_url, name_html in DDG_RESULT_RE.findall(html):
+        url = unquote(encoded_url)
+        name = _HTML_TAG_RE.sub("", name_html).strip()
+        if url and name:
+            out.append((name, url))
+    return out
+
+
+def _is_usable_domain(domain: str) -> bool:
+    if not domain or "duckduckgo.com" in domain:
+        return False
+    return not any(agg in domain for agg in CONFIG.aggregator_domains)
+
+
+def ddg_find_website_for_business(name: str, location: str) -> Optional[str]:
+    """IMPROVED: per-candidate fallback when Geoapify has a place but no
+    website — looks the business up by name instead of leaving it dead."""
+    html = free_web_search(f'"{name}" {location} official website')
+    for _, url in extract_ddg_results(html):
+        if _is_usable_domain(urlparse(url).netloc.lower()):
+            return url
+    return None
+
+
+def overpass_business_search(niche: str, location: str, limit: int) -> List[Dict]:
+    """IMPROVED: queries raw OSM craft= tags via the free Overpass API — no
+    key, no daily quota, and it reaches trades Geoapify's category list
+    doesn't expose. Coverage is still genuinely sparse for solo-operator
+    trades with no storefront; this widens the net, it doesn't fill it."""
+    tags = map_niche_to_overpass_tags(niche)
+    if not tags:
+        return []
+    record = geoapify_geocode_record(location)
+    if not record or not record.get("lat") or not record.get("lon"):
+        return []
+    lat, lon = record["lat"], record["lon"]
+    radius_m = 20000
+    clauses = "".join(
+        f'node["{k}"="{v}"](around:{radius_m},{lat},{lon});'
+        f'way["{k}"="{v}"](around:{radius_m},{lat},{lon});'
+        for k, v in tags
+    )
+    query = f"[out:json][timeout:20];({clauses});out center tags {limit};"
+    try:
+        resp = SESSION.post("https://overpass-api.de/api/interpreter", data={"data": query}, timeout=25)
+        resp.raise_for_status()
+        elements = resp.json().get("elements", [])
+    except (requests.RequestException, ValueError) as exc:
+        STATE.record_error(f"Overpass query failed for {niche}/{location}: {exc}")
+        return []
+
+    out: List[Dict] = []
+    for el in elements:
+        el_tags = el.get("tags", {})
+        name = el_tags.get("name")
+        if not name:
+            continue
+        website = el_tags.get("website") or el_tags.get("contact:website")
+        if not website:
+            website = ddg_find_website_for_business(name, location)
+        if website:
+            out.append({"name": name, "uri": website})
+        if len(out) >= limit:
+            break
+    return out
+
+
+# IMPROVED: DDG's html-lite endpoint returns roughly one page (~10 results)
+# per query, so a single query was capping fallback-niche discovery well
+# below MAX_HUNT_RESULTS regardless of the limit passed in. Issuing a few
+# differently-phrased queries (still serialized through the same 2s shared
+# throttle) pulls in a materially larger, more diverse candidate pool per
+# cycle for the niches that have no structured data source at all.
+DDG_QUERY_VARIANTS = [
+    "{niche} companies {location}",
+    "{niche} contractors {location}",
+    "best {niche} {location}",
+]
+
+
+def ddg_business_discovery(niche: str, location: str, limit: int) -> List[Dict]:
+    """Fallback hunt source for niches with no Geoapify/Overpass match.
+    Lower precision than a real places API — expect noisier results."""
+    seen_domains = set()
+    out: List[Dict] = []
+    for template in DDG_QUERY_VARIANTS:
+        if len(out) >= limit:
+            break
+        html = free_web_search(template.format(niche=niche, location=location))
+        for name, url in extract_ddg_results(html):
+            domain = urlparse(url).netloc.lower()
+            if not _is_usable_domain(domain) or domain in seen_domains:
+                continue
+            seen_domains.add(domain)
+            out.append({"name": name, "uri": url})
+            if len(out) >= limit:
+                break
+    return out
+
+
+def hunt_candidates(niche: str, location: str) -> List[Dict]:
+    """Returns a list of {"name":..., "uri":...} candidate businesses.
+    Tries, in order: Geoapify category (best precision, quota-limited),
+    Overpass craft-tag lookup (free, no quota, narrower coverage), then
+    DuckDuckGo business discovery (widest coverage, lowest precision)."""
+    candidates: List[Dict] = []
+    category = map_niche_to_category(niche)
+    if category and CONFIG.geoapify_api_key:
+        places = geoapify_places_search(category, location, CONFIG.max_hunt_results)
+        for i, place in enumerate(places):
+            name = place.get("name")
+            if not name:
+                continue
+            website = None
+            # IMPROVED: cap Place Details lookups per cycle — they're the
+            # most quota-expensive call and the least likely to pay off.
+            if i < CONFIG.geoapify_details_per_cycle and place.get("place_id"):
+                website = geoapify_place_website(place["place_id"])
+            if not website:
+                website = ddg_find_website_for_business(name, location)
+            if website:
+                candidates.append({"name": name, "uri": website})
+    if len(candidates) < CONFIG.max_hunt_results:
+        candidates.extend(overpass_business_search(niche, location, CONFIG.max_hunt_results - len(candidates)))
+    if len(candidates) < CONFIG.max_hunt_results:
+        candidates.extend(ddg_business_discovery(niche, location, CONFIG.max_hunt_results - len(candidates)))
+    return candidates
+
 
 
 # IMPROVED: multi-page crawl instead of one homepage regex pass. Most sites
@@ -836,9 +1176,16 @@ def scrape_domain(candidate: dict) -> dict:
 
         owner_name, contact_email = prioritize_contact(found_contacts)
         result["contact_email"] = contact_email
-        result["founder_name"] = owner_name or find_founder_name(raw_domain, candidate["business_name"])
-        result["competitor"] = find_competitor(candidate["location"], candidate["niche"], candidate["business_name"])
-        result["gbp_status"] = check_gbp_status(candidate["business_name"], candidate["location"])
+        # IMPROVED: the three enrichment lookups below are each a DDG call
+        # under the shared 2s throttle. They were running unconditionally,
+        # burning that throttle on candidates with no contact email at all
+        # — leads that can never be sent to anyway. Skipping them here is
+        # the single biggest throughput fix for hitting a daily send target:
+        # it roughly triples how many real candidates fit in a cycle window.
+        if contact_email:
+            result["founder_name"] = owner_name or find_founder_name(raw_domain, candidate["business_name"])
+            result["competitor"] = find_competitor(candidate["location"], candidate["niche"], candidate["business_name"])
+            result["gbp_status"] = check_gbp_status(candidate["business_name"], candidate["location"])
         result["status"] = "success"
     except Exception as exc:
         STATE.record_error(f"scrape_domain failed for {raw_domain}: {exc}")
@@ -950,19 +1297,10 @@ def run_hunt(niche: str, location: str):
     STATE.set_status(f"Hunting: {niche} in {location}")
     STATE.last_cycle_started_at = datetime.now().isoformat(timespec="seconds")
 
-    url = "https://places.googleapis.com/v1/places:searchText"
-    headers = {
-        "Content-Type": "application/json",
-        "X-Goog-Api-Key": CONFIG.google_places_api_key,
-        "X-Goog-FieldMask": "places.displayName,places.websiteUri",
-    }
-    payload = {"textQuery": f"{niche} in {location}", "maxResultCount": CONFIG.max_hunt_results}
-
     try:
-        res = SESSION.post(url, json=payload, headers=headers, timeout=15).json()
-        places = res.get("places", [])
-    except (requests.RequestException, ValueError) as exc:
-        STATE.record_error(f"Places API failed for {niche}/{location}: {exc}")
+        places = hunt_candidates(niche, location)
+    except Exception as exc:
+        STATE.record_error(f"hunt_candidates failed for {niche}/{location}: {exc}")
         places = []
 
     results_df = pd.DataFrame(columns=["Business Name", "Domain", "Project Type", "Email Status", "Notes"])
@@ -971,8 +1309,8 @@ def run_hunt(niche: str, location: str):
         if STATE.email_cap_reached_today:
             STATE.set_status("Daily email cap reached — hunting paused")
             break
-        name = p.get("displayName", {}).get("text", "Unknown")
-        uri = p.get("websiteUri")
+        name = p.get("name", "Unknown")
+        uri = p.get("uri")
         if not uri:
             continue
         domain = urlparse(uri).netloc.lower()
