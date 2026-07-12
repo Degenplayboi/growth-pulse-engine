@@ -11,14 +11,54 @@ services:
         sync: false
       - key: EMAIL_PASS
         sync: false
+      # IMPROVED: BREVO_API_KEY is read by send_beast_email() but was never
+      # declared here — without it, every send silently fails.
+      - key: BREVO_API_KEY
+        sync: false
       - key: GOOGLE_PLACES_API_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
         sync: false
       - key: SENDER_DISPLAY_NAME
         value: Growth Pulse Solutions
       - key: MAX_HUNT_RESULTS
-        value: "100" # Maximize the pull capacity per location branch
+        value: "100"
       - key: LOOP_INTERVAL_SECONDS
-        value: "1800" # Increase frequency to process leads every 30 minutes
+        value: "1800"
+      - key: DAILY_EMAIL_CAP
+        value: "180"
+      # IMPROVED: warm-up ramp inputs — set CAMPAIGN_START_DATE (YYYY-MM-DD)
+      # once, on first deploy, to the date you actually start sending.
+      - key: CAMPAIGN_START_DATE
+        value: ""
+      - key: WARMUP_DAYS
+        value: "10"
+      - key: WARMUP_START_CAP
+        value: "20"
+      - key: EMAIL_SEND_DELAY_SECONDS
+        value: "5"
+      - key: EMAIL_SEND_JITTER_SECONDS
+        value: "4"
+
+      # --- PHASE 4: PERSISTENCE (survives Render free-tier restarts) ---
+      # A private GitHub repo is fine. Token needs "repo" (or fine-grained
+      # Contents read/write) scope on that one repo.
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: GITHUB_BACKUP_REPO
+        value: ""
+      - key: GITHUB_BACKUP_BRANCH
+        value: "main"
+      - key: BACKUP_INTERVAL_SECONDS
+        value: "900"
+
+      # --- PHASE 4: SEND-WINDOW GATING (local business hours per city) ---
+      - key: SEND_WINDOW_START_HOUR
+        value: "9"
+      - key: SEND_WINDOW_END_HOUR
+        value: "17"
 
       # --- GLOBAL TARGET MATRIX (HIGH-BUDGET METROS & HIGH-VALUE NICHES) ---
       - key: AUTOMATED_NICHES
