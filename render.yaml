@@ -17,6 +17,10 @@ services:
         sync: false
       # IMPROVED: Google Places replaced with Geoapify. Sign up free at
       # myprojects.geoapify.com — no credit card required.
+      # NOTE: Overpass/OSM discovery no longer requires this key — it falls
+      # back to Nominatim (free, keyless) for geocoding if this is unset or
+      # its daily quota is exhausted. Still recommended for the Places
+      # category search precision on niches that map to it.
       - key: GEOAPIFY_API_KEY
         sync: false
       - key: GEOAPIFY_DAILY_CALL_CAP
