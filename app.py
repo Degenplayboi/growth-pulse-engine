@@ -1253,17 +1253,7 @@ def hunt_candidates(niche: str, location: str) -> List[Dict]:
             if not website:
                 website = ddg_find_website_for_business(name, location)
             if website:
-         
-        "sender": {"name": CONFIG.sender_display_name, "email": sender_email},
-        "to": [{"email": recipient_email}],
-        "subject": subject,
-        "htmlContent": html_body,
-        "textContent": text_body,
-        # IMPROVED: List-Unsubscribe improves inbox placement and is close
-        # to mandatory for bulk cold outreach under Gmail/Yahoo bulk-sender
-        # rules; the old payload had no unsubscribe signal at all.
-        "headers": {"List-Unsubscribe": f"mailto:{sender_email}?subject=unsubscribe"},
-    }
+        
 
     try:
         res = SESSION.post(
