@@ -15,18 +15,36 @@ services:
       # declared here — without it, every send silently fails.
       - key: BREVO_API_KEY
         sync: false
-      - key: GOOGLE_PLACES_API_KEY
+      # IMPROVED: Google Places replaced with Geoapify. Sign up free at
+      # myprojects.geoapify.com — no credit card required.
+      - key: GEOAPIFY_API_KEY
         sync: false
+      - key: GEOAPIFY_DAILY_CALL_CAP
+        value: "2500"
+      - key: GEOAPIFY_DETAILS_PER_CYCLE
+        value: "15"
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
       - key: SENDER_DISPLAY_NAME
         value: Growth Pulse Solutions
+      # IMPROVED: lowered from 100 — each candidate can trigger a Geoapify
+      # Place Details call and/or a rate-limited DDG lookup, so a large
+      # number here now costs real time and quota per cycle, not just API
+      # calls. Raise once you've watched a few cycles complete cleanly.
+      # IMPROVED for 180/day target: raised back up now that scrape_domain
+      # skips founder/competitor/GBP lookups for candidates with no email
+      # (was the biggest throughput leak) and hunt_candidates pulls from
+      # three sources (Geoapify → Overpass → multi-query DDG) instead of one.
       - key: MAX_HUNT_RESULTS
-        value: "100"
+        value: "30"
+      # IMPROVED: shortened from 1800s so more of the 104 niche×city
+      # combinations get a turn per day. This is a real trade-off against
+      # DDG courtesy scraping — if you see search calls starting to fail,
+      # raise this back up rather than pushing it lower.
       - key: LOOP_INTERVAL_SECONDS
-        value: "1800"
+        value: "900"
       - key: DAILY_EMAIL_CAP
         value: "180"
       # IMPROVED: warm-up ramp inputs — set CAMPAIGN_START_DATE (YYYY-MM-DD)
@@ -61,6 +79,11 @@ services:
         value: "17"
 
       # --- GLOBAL TARGET MATRIX (HIGH-BUDGET METROS & HIGH-VALUE NICHES) ---
+      # NOTE: of these, only "Commercial Electricians" maps to a real
+      # Geoapify category (service.electrician). Everything else here runs
+      # through the DuckDuckGo business-discovery fallback instead of a
+      # structured places API — lower precision, worth watching lead volume
+      # per niche on the dashboard before assuming it's underperforming.
       - key: AUTOMATED_NICHES
         value: "Commercial Roofing, Solar Panel Installation, Custom Home Builders, Luxury Landscaping, Foundation Repair Contractors, HVAC Mechanical, Commercial Electricians, Swimming Pool Builders"
       - key: AUTOMATED_CITIES
