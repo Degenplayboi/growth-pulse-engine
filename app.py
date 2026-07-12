@@ -11,46 +11,79 @@ Architecture:
   B. Scraper + pixel verifier — extracts contact email and checks for tracking pixels.
   C. Persistent deduplication — processed_companies.txt.
   D. SQLite-backed storage — tracking leads, emails, and follow-ups.
-  E. SMTP dispatch engine — with exponential backoff retry.
+  E. Brevo dispatch engine — with daily cap and retry.
   F. Gradio dashboard — live stream of results.
+  G. GlobalHunterThread — autonomous niche x city rotation, driven by
+     AUTOMATED_NICHES / AUTOMATED_CITIES env vars. (Previously declared
+     in render.yaml but never actually wired into a background loop —
+     this rebuild makes it real.)
 
-# BEAST PHASE 1 IMPROVEMENTS:
-- Daily Email Cap (default 180, configurable via env var) with daily reset.
-- Hyper-Personalized Email Template.
-- Free Founder/Owner Email Finder Module.
-- Competitor Intelligence.
-- Better Contact Extraction.
+# BEAST PHASE 3 IMPROVEMENTS (this rebuild):
+- IMPROVED: Real autonomous hunt loop (GlobalHunterThread) — niches x cities
+  rotation was configured in render.yaml but no code ever consumed it.
+- IMPROVED: Founder/competitor/GBP lookups moved off raw Google HTML scraping
+  (which returns consent-wall / CAPTCHA markup for most non-US IPs and gets
+  blocked fast) onto DuckDuckGo's HTML-lite endpoint, which is scrape-tolerant.
+- IMPROVED: Multi-page contact crawl (home + /contact + /about + /team) with
+  mailto: extraction and a junk-email blocklist, instead of one regex pass
+  over the homepage only.
+- IMPROVED: 3-tier contact prioritization (named personal mailto > role-based
+  founder/owner/ceo local-part > generic info/contact) instead of a single
+  keyword pass.
+- IMPROVED: Deliverability — plain-text alternative part, List-Unsubscribe
+  header, jittered send delay, warm-up ramp on top of DAILY_EMAIL_CAP.
+- IMPROVED: HTTP session with retry/backoff + http/https/www fallback instead
+  of a single unguarded requests.get.
+- IMPROVED: Errors are now counted and surfaced in STATE (previously
+  swallowed silently by bare except blocks).
+- IMPROVED: Gradio dashboard auto-refresh via gr.Timer instead of the
+  version-fragile demo.load(..., every=...) pattern.
 
-# BEAST PHASE 2 IMPROVEMENTS (The Conversion Dominator):
-- Automated "Video Audit" Hook: Simulates a personalized audit mention.
-- GBP Intelligence: Checks Google Business Profile presence/reviews heuristic.
-- Multi-Step Follow-up Logic: Tracks sent dates and triggers "nudge" emails.
-- Deep-Link Scraping: Identifies specific project types (e.g., "Commercial Roofing").
-- Telegram/Webhook Notifications: Real-time alerts for founder matches.
+# BEAST PHASE 4 IMPROVEMENTS (this pass):
+- IMPROVED: Render's free web tier has no persistent disk — every redeploy
+  or restart wiped growth_pulse.db and processed_companies.txt, silently
+  losing lead history and re-emailing already-contacted companies. This
+  adds a GitHub-backed snapshot/restore (Contents API over plain requests,
+  no new client library to trust blind) that pulls state on boot and pushes
+  it after every hunt cycle and on a timer.
+- IMPROVED: MX-record check before send — domains with no mail server are
+  filtered out before hitting Brevo, cutting hard bounces that damage
+  sender reputation.
+- IMPROVED: Timezone-aware send gating — AUTOMATED_CITIES spans US/UK/AU/UAE
+  time zones; sends now hold until local business hours instead of firing
+  whenever the loop happens to reach that city in UTC.
+- IMPROVED: Dropped the "60-second video walkthrough" promise from the
+  email copy — nothing in this stack generates that video, so a prospect
+  replying YES was a guaranteed broken promise and a spam-complaint risk.
+  Replaced with a claim the system can actually back up on reply.
 """
 
 import os
 import re
-import ssl
 import csv
+import json
 import time
+import base64
+import random
 import sqlite3
 import logging
-import smtplib
-import socket
 import threading
 from datetime import datetime, date, timedelta
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
+from urllib.parse import urlparse, urljoin, quote
+from zoneinfo import ZoneInfo
 
 import requests
+from requests.adapters import HTTPAdapter, Retry
 import gradio as gr
 import pandas as pd
-import html
-from urllib.parse import urlparse
+
+try:
+    import dns.resolver  # dnspython
+    _DNS_AVAILABLE = True
+except ImportError:
+    _DNS_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -70,8 +103,7 @@ logger = logging.getLogger("growth_pulse")
 class Config:
     email_user: Optional[str] = field(default_factory=lambda: os.environ.get("EMAIL_USER"))
     email_pass: Optional[str] = field(default_factory=lambda: os.environ.get("EMAIL_PASS"))
-    smtp_host: str = "smtp.gmail.com"
-    smtp_port: int = 465
+    brevo_api_key: Optional[str] = field(default_factory=lambda: os.environ.get("BREVO_API_KEY"))
     sender_display_name: str = field(default_factory=lambda: os.environ.get("SENDER_DISPLAY_NAME", "Growth Pulse"))
 
     google_places_api_key: Optional[str] = field(default_factory=lambda: os.environ.get("GOOGLE_PLACES_API_KEY"))
@@ -80,19 +112,41 @@ class Config:
 
     data_dir: str = field(default_factory=lambda: os.environ.get("DATA_DIR", "."))
     sqlite_filename: str = "growth_pulse.db"
-    sent_leads_filename: str = "sent_leads.txt"
     processed_companies_filename: str = "processed_companies.txt"
 
-    leads_queue_path: str = field(default_factory=lambda: os.environ.get("LEADS_QUEUE_PATH", "leads_queue.csv"))
+    # IMPROVED: these two env vars were already declared in render.yaml but
+    # nothing in the old app.py ever read them — autonomous mode was dead.
+    automated_niches: List[str] = field(default_factory=lambda: [
+        n.strip() for n in os.environ.get("AUTOMATED_NICHES", "").split(",") if n.strip()
+    ])
+    automated_cities: List[str] = field(default_factory=lambda: [
+        c.strip() for c in os.environ.get("AUTOMATED_CITIES", "").split(",") if c.strip()
+    ])
 
     scrape_timeout_seconds: int = 8
-    scrape_max_workers: int = 6
-    loop_interval_seconds: int = int(os.environ.get("LOOP_INTERVAL_SECONDS", "300"))
-    max_retries: int = 3
+    loop_interval_seconds: int = int(os.environ.get("LOOP_INTERVAL_SECONDS", "1800"))
     max_hunt_results: int = int(os.environ.get("MAX_HUNT_RESULTS", "20"))
-    
+
     daily_email_cap: int = int(os.environ.get("DAILY_EMAIL_CAP", "180"))
+    # IMPROVED: warm-up ramp so a brand-new sending domain doesn't blast the
+    # full cap on day one and get flagged. Ramps to full cap over 10 days.
+    warmup_days: int = int(os.environ.get("WARMUP_DAYS", "10"))
+    warmup_start_cap: int = int(os.environ.get("WARMUP_START_CAP", "20"))
+    campaign_start_date: str = field(default_factory=lambda: os.environ.get("CAMPAIGN_START_DATE", ""))
+
     email_send_delay_seconds: int = int(os.environ.get("EMAIL_SEND_DELAY_SECONDS", "5"))
+    email_send_jitter_seconds: int = int(os.environ.get("EMAIL_SEND_JITTER_SECONDS", "4"))
+
+    # IMPROVED: GitHub-backed persistence. Set these once (a free private
+    # repo works fine) so state survives Render restarts/redeploys.
+    github_token: Optional[str] = field(default_factory=lambda: os.environ.get("GITHUB_TOKEN"))
+    github_repo: Optional[str] = field(default_factory=lambda: os.environ.get("GITHUB_BACKUP_REPO"))  # "owner/repo"
+    github_backup_branch: str = field(default_factory=lambda: os.environ.get("GITHUB_BACKUP_BRANCH", "main"))
+    backup_interval_seconds: int = int(os.environ.get("BACKUP_INTERVAL_SECONDS", "900"))
+
+    # IMPROVED: business-hours send gating, local to each target city.
+    send_window_start_hour: int = int(os.environ.get("SEND_WINDOW_START_HOUR", "9"))
+    send_window_end_hour: int = int(os.environ.get("SEND_WINDOW_END_HOUR", "17"))
 
     user_agent: str = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -108,13 +162,18 @@ class Config:
         "porch.com", "buildzoom.com", "google.com",
     )
 
+    # IMPROVED: junk local-parts / domains that regex email-scraping tends to
+    # false-positive on (tracking pixels, CDN assets, template placeholders).
+    junk_email_markers: tuple = (
+        "sentry.io", "wixpress.com", "example.com", "godaddy.com",
+        "w3.org", "schema.org", "yourdomain", "domain.com",
+        "@2x", ".png", ".jpg", ".jpeg", ".svg", ".gif", ".webp",
+        "wordpress.com", "gravatar.com", "cloudflare.com",
+    )
+
     @property
     def sqlite_path(self) -> str:
         return os.path.join(self.data_dir, self.sqlite_filename)
-
-    @property
-    def sent_leads_path(self) -> str:
-        return os.path.join(self.data_dir, self.sent_leads_filename)
 
     @property
     def processed_companies_path(self) -> str:
@@ -122,6 +181,157 @@ class Config:
 
 
 CONFIG = Config()
+
+# IMPROVED: a shared, retrying HTTP session instead of bare requests.get calls
+# scattered through the file. Handles transient DNS/connection resets so a
+# single flaky target doesn't quietly drop a lead.
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": CONFIG.user_agent})
+_retry = Retry(total=2, backoff_factor=0.6, status_forcelist=[429, 500, 502, 503, 504])
+SESSION.mount("https://", HTTPAdapter(max_retries=_retry))
+SESSION.mount("http://", HTTPAdapter(max_retries=_retry))
+
+# ---------------------------------------------------------------------------
+# IMPROVED: Timezone-aware send gating
+# ---------------------------------------------------------------------------
+CITY_TIMEZONES: Dict[str, str] = {
+    "new york": "America/New_York",
+    "atlanta": "America/New_York",
+    "miami": "America/New_York",
+    "chicago": "America/Chicago",
+    "houston": "America/Chicago",
+    "dallas": "America/Chicago",
+    "phoenix": "America/Phoenix",
+    "las vegas": "America/Los_Angeles",
+    "los angeles": "America/Los_Angeles",
+    "toronto": "America/Toronto",
+    "london": "Europe/London",
+    "sydney": "Australia/Sydney",
+    "dubai": "Asia/Dubai",
+}
+
+
+def resolve_city_timezone(location: str) -> ZoneInfo:
+    lowered = location.lower()
+    for key, tz_name in CITY_TIMEZONES.items():
+        if key in lowered:
+            try:
+                return ZoneInfo(tz_name)
+            except Exception:
+                break
+    return ZoneInfo("America/New_York")
+
+
+def is_within_send_window(location: str) -> bool:
+    """IMPROVED: hold sends outside local business hours instead of firing
+    on whatever UTC moment the hunt loop happens to reach that city."""
+    tz = resolve_city_timezone(location)
+    local_hour = datetime.now(tz).hour
+    return CONFIG.send_window_start_hour <= local_hour < CONFIG.send_window_end_hour
+
+
+# ---------------------------------------------------------------------------
+# IMPROVED: MX-record check
+# ---------------------------------------------------------------------------
+
+def has_mx_record(email_domain: str) -> bool:
+    if not _DNS_AVAILABLE:
+        return True
+    try:
+        answers = dns.resolver.resolve(email_domain, "MX", lifetime=5)
+        return len(answers) > 0
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# IMPROVED: GitHub-backed persistence
+# ---------------------------------------------------------------------------
+# Residual risk stated plainly: this is periodic snapshotting, not per-write
+# replication. A crash between syncs loses whatever changed in that window
+# (at most backup_interval_seconds of activity) — a real gap, not a hidden
+# one, and the correct trade-off against losing everything on every restart.
+
+class GitHubBackup:
+    def __init__(self, config: Config) -> None:
+        self.config = config
+        self.enabled = bool(config.github_token and config.github_repo)
+        self._lock = threading.Lock()
+        if not self.enabled:
+            logger.info("GitHub backup disabled — set GITHUB_TOKEN and GITHUB_BACKUP_REPO to enable.")
+
+    def _api_url(self, repo_path: str) -> str:
+        return f"https://api.github.com/repos/{self.config.github_repo}/contents/{repo_path}"
+
+    def _headers(self) -> dict:
+        return {
+            "Authorization": f"token {self.config.github_token}",
+            "Accept": "application/vnd.github+json",
+        }
+
+    def restore_file(self, local_path: str, repo_path: str) -> bool:
+        if not self.enabled:
+            return False
+        try:
+            resp = SESSION.get(
+                self._api_url(repo_path),
+                headers=self._headers(),
+                params={"ref": self.config.github_backup_branch},
+                timeout=15,
+            )
+            if resp.status_code == 404:
+                logger.info(f"No prior GitHub backup found for {repo_path} — starting fresh.")
+                return False
+            resp.raise_for_status()
+            content_b64 = resp.json().get("content", "")
+            raw = base64.b64decode(content_b64)
+            os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
+            with open(local_path, "wb") as handle:
+                handle.write(raw)
+            logger.info(f"Restored {repo_path} from GitHub backup ({len(raw)} bytes).")
+            return True
+        except requests.RequestException as exc:
+            STATE.record_error(f"GitHub restore failed for {repo_path}: {exc}")
+            return False
+
+    def push_file(self, local_path: str, repo_path: str) -> bool:
+        if not self.enabled or not os.path.exists(local_path):
+            return False
+        with self._lock:
+            try:
+                with open(local_path, "rb") as handle:
+                    content_b64 = base64.b64encode(handle.read()).decode("ascii")
+
+                sha = None
+                existing = SESSION.get(
+                    self._api_url(repo_path),
+                    headers=self._headers(),
+                    params={"ref": self.config.github_backup_branch},
+                    timeout=15,
+                )
+                if existing.status_code == 200:
+                    sha = existing.json().get("sha")
+
+                payload = {
+                    "message": f"backup: {repo_path} @ {datetime.now().isoformat(timespec='seconds')}",
+                    "content": content_b64,
+                    "branch": self.config.github_backup_branch,
+                }
+                if sha:
+                    payload["sha"] = sha
+
+                resp = SESSION.put(self._api_url(repo_path), headers=self._headers(), json=payload, timeout=20)
+                if resp.status_code not in (200, 201):
+                    STATE.record_error(f"GitHub backup push failed for {repo_path}: {resp.status_code} {resp.text[:200]}")
+                    return False
+                return True
+            except requests.RequestException as exc:
+                STATE.record_error(f"GitHub backup push exception for {repo_path}: {exc}")
+                return False
+
+    def sync_all(self, files: List[Tuple[str, str]]) -> None:
+        for local_path, repo_path in files:
+            self.push_file(local_path, repo_path)
 
 # ---------------------------------------------------------------------------
 # Shared runtime state
@@ -139,6 +349,7 @@ class EngineState:
         self.last_cycle_started_at: Optional[str] = None
         self.last_cycle_completed_at: Optional[str] = None
         self.last_error: Optional[str] = None
+        self.current_niche_city_index: int = 0
         self._counter_date: date = date.today()
 
     def _roll_daily_counter_if_needed(self) -> None:
@@ -152,11 +363,32 @@ class EngineState:
         with self._lock:
             self.status = status
 
+    def record_error(self, message: str) -> None:
+        with self._lock:
+            self.errors_total += 1
+            self.last_error = message
+        logger.error(message)
+
+    def todays_cap(self) -> int:
+        """# IMPROVED: warm-up ramp — grows linearly from warmup_start_cap to
+        daily_email_cap over warmup_days, based on CAMPAIGN_START_DATE."""
+        if not CONFIG.campaign_start_date:
+            return CONFIG.daily_email_cap
+        try:
+            start = datetime.strptime(CONFIG.campaign_start_date, "%Y-%m-%d").date()
+        except ValueError:
+            return CONFIG.daily_email_cap
+        days_in = (date.today() - start).days
+        if days_in >= CONFIG.warmup_days or days_in < 0:
+            return CONFIG.daily_email_cap
+        step = (CONFIG.daily_email_cap - CONFIG.warmup_start_cap) / max(CONFIG.warmup_days, 1)
+        return int(CONFIG.warmup_start_cap + step * days_in)
+
     def record_email_sent(self) -> None:
         with self._lock:
             self._roll_daily_counter_if_needed()
             self.emails_dispatched_today += 1
-            if self.emails_dispatched_today >= CONFIG.daily_email_cap:
+            if self.emails_dispatched_today >= self.todays_cap():
                 self.email_cap_reached_today = True
 
     def snapshot(self) -> dict:
@@ -165,6 +397,7 @@ class EngineState:
             return {
                 "status": self.status,
                 "emails_dispatched_today": self.emails_dispatched_today,
+                "todays_cap": self.todays_cap(),
                 "email_cap_reached_today": self.email_cap_reached_today,
                 "leads_scraped_total": self.leads_scraped_total,
                 "leads_with_pixel_total": self.leads_with_pixel_total,
@@ -176,6 +409,13 @@ class EngineState:
 
 
 STATE = EngineState()
+GITHUB_BACKUP = GitHubBackup(CONFIG)
+
+# IMPROVED: pull last known state before anything else touches disk, so a
+# fresh Render instance picks up leads/dedup history instead of starting blank.
+if GITHUB_BACKUP.enabled:
+    GITHUB_BACKUP.restore_file(CONFIG.sqlite_path, "backup/growth_pulse.db")
+    GITHUB_BACKUP.restore_file(CONFIG.processed_companies_path, "backup/processed_companies.txt")
 
 # ---------------------------------------------------------------------------
 # Persistent deduplication log
@@ -216,7 +456,7 @@ class DeduplicationTracker:
 DEDUP = DeduplicationTracker(CONFIG)
 
 # ---------------------------------------------------------------------------
-# Storage layer (Updated for Phase 2)
+# Storage layer
 # ---------------------------------------------------------------------------
 
 class StorageBackend:
@@ -230,7 +470,6 @@ class StorageBackend:
         with self._local_lock:
             connection = sqlite3.connect(self.config.sqlite_path)
             cursor = connection.cursor()
-            # # IMPROVED: Added project_type and follow_up_step
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS leads (
@@ -248,10 +487,21 @@ class StorageBackend:
                     project_type TEXT,
                     source TEXT NOT NULL DEFAULT 'queue',
                     scraped_at TEXT NOT NULL,
+                    founder_name TEXT,
+                    competitor TEXT,
+                    gbp_status TEXT,
+                    location TEXT,
                     UNIQUE(domain)
                 )
                 """
             )
+            # IMPROVED: ALTER-if-missing for these columns, since a DB
+            # restored from an older GitHub backup snapshot may predate them.
+            for column in ("founder_name", "competitor", "gbp_status", "location"):
+                try:
+                    cursor.execute(f"ALTER TABLE leads ADD COLUMN {column} TEXT")
+                except sqlite3.OperationalError:
+                    pass  # column already exists
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS dispatch_log (
@@ -269,7 +519,9 @@ class StorageBackend:
 
     def save_lead(self, domain: str, business_name: Optional[str], contact_email: Optional[str],
                   phone_number: Optional[str], has_meta_pixel: bool, has_google_ads_tag: bool,
-                  scrape_status: str, source: str, project_type: str = None) -> None:
+                  scrape_status: str, source: str, project_type: str = None,
+                  founder_name: str = None, competitor: str = None, gbp_status: str = None,
+                  location: str = None) -> None:
         scraped_at = datetime.now().isoformat(timespec="seconds")
         with self._local_lock:
             connection = sqlite3.connect(self.config.sqlite_path)
@@ -277,8 +529,9 @@ class StorageBackend:
             cursor.execute(
                 """
                 INSERT INTO leads (domain, business_name, contact_email, phone_number, has_meta_pixel,
-                                    has_google_ads_tag, scrape_status, source, scraped_at, project_type)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    has_google_ads_tag, scrape_status, source, scraped_at, project_type,
+                                    founder_name, competitor, gbp_status, location)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(domain) DO UPDATE SET
                     business_name=excluded.business_name,
                     contact_email=excluded.contact_email,
@@ -288,10 +541,15 @@ class StorageBackend:
                     scrape_status=excluded.scrape_status,
                     source=excluded.source,
                     scraped_at=excluded.scraped_at,
-                    project_type=COALESCE(excluded.project_type, leads.project_type)
+                    project_type=COALESCE(excluded.project_type, leads.project_type),
+                    founder_name=COALESCE(excluded.founder_name, leads.founder_name),
+                    competitor=COALESCE(excluded.competitor, leads.competitor),
+                    gbp_status=COALESCE(excluded.gbp_status, leads.gbp_status),
+                    location=COALESCE(excluded.location, leads.location)
                 """,
                 (domain, business_name, contact_email, phone_number, int(has_meta_pixel),
-                 int(has_google_ads_tag), scrape_status, source, scraped_at, project_type),
+                 int(has_google_ads_tag), scrape_status, source, scraped_at, project_type,
+                 founder_name, competitor, gbp_status, location),
             )
             connection.commit()
             connection.close()
@@ -312,17 +570,31 @@ class StorageBackend:
             connection.commit()
             connection.close()
 
-    def get_follow_up_leads(self, days_delay: int = 3) -> List[Dict]:
-        """# IMPROVED: Fetches leads ready for a follow-up nudge."""
+    def get_follow_up_leads(self, days_delay: int = 3, max_step: int = 2) -> List[Dict]:
+        """IMPROVED: bounded to max_step so a lead can't be nudged forever."""
         cutoff = (datetime.now() - timedelta(days=days_delay)).isoformat()
         with self._local_lock:
             connection = sqlite3.connect(self.config.sqlite_path)
             connection.row_factory = sqlite3.Row
             cursor = connection.cursor()
             cursor.execute(
-                "SELECT * FROM leads WHERE email_status='success' AND follow_up_step=1 AND last_email_sent_at < ?",
-                (cutoff,)
+                """SELECT * FROM leads
+                   WHERE email_status='success' AND follow_up_step >= 1
+                   AND follow_up_step < ? AND last_email_sent_at < ?""",
+                (max_step, cutoff)
             )
+            rows = [dict(row) for row in cursor.fetchall()]
+            connection.close()
+            return rows
+
+    def get_pending_timing_leads(self) -> List[Dict]:
+        """IMPROVED: leads scraped outside their city's send window, held
+        here until the dispatch loop finds them inside business hours."""
+        with self._local_lock:
+            connection = sqlite3.connect(self.config.sqlite_path)
+            connection.row_factory = sqlite3.Row
+            cursor = connection.cursor()
+            cursor.execute("SELECT * FROM leads WHERE email_status='pending_timing'")
             rows = [dict(row) for row in cursor.fetchall()]
             connection.close()
             return rows
@@ -330,73 +602,208 @@ class StorageBackend:
 
 STORAGE = StorageBackend(CONFIG)
 
-# ---------------------------------------------------------------------------
-# # IMPROVED: Beast Phase 2 Core Modules
-# ---------------------------------------------------------------------------
 
-def notify_me(message: str):
-    """# IMPROVED: Sends real-time notification via Telegram."""
-    if CONFIG.telegram_bot_token and CONFIG.telegram_chat_id:
-        url = f"https://api.telegram.org/bot{CONFIG.telegram_bot_token}/sendMessage"
+def backup_sync_now() -> None:
+    if not GITHUB_BACKUP.enabled:
+        return
+    GITHUB_BACKUP.sync_all([
+        (CONFIG.sqlite_path, "backup/growth_pulse.db"),
+        (CONFIG.processed_companies_path, "backup/processed_companies.txt"),
+    ])
+
+
+def backup_loop() -> None:
+    if not GITHUB_BACKUP.enabled:
+        return
+    while True:
+        time.sleep(CONFIG.backup_interval_seconds)
         try:
-            requests.post(url, json={"chat_id": CONFIG.telegram_chat_id, "text": message}, timeout=5)
-        except:
-            pass
+            backup_sync_now()
+        except Exception as exc:
+            STATE.record_error(f"Backup loop error: {exc}")
 
-def free_google_search(query: str) -> str:
-    headers = {"User-Agent": CONFIG.user_agent}
-    try:
-        search_url = f"https://www.google.com/search?q={requests.utils.quote(query)}"
-        response = requests.get(search_url, headers=headers, timeout=10)
-        return response.text
-    except:
+# ---------------------------------------------------------------------------
+# IMPROVED: Search intelligence — DuckDuckGo HTML-lite instead of raw Google
+# Google's public search HTML returns a CAPTCHA/consent wall to almost any
+# scripted request within a handful of calls, especially from shared cloud
+# IPs and from non-US regions (several AUTOMATED_CITIES are UK/AU/UAE) — the
+# old free_google_search() would have gone dark within the first hunt cycle.
+# DuckDuckGo's non-JS "html" endpoint has no login wall and is commonly used
+# for lightweight scraping; it is still a courtesy scrape, so this keeps
+# request volume low, sequential, and rate-limited.
+# ---------------------------------------------------------------------------
+
+_last_search_at = 0.0
+_search_lock = threading.Lock()
+
+def free_web_search(query: str) -> str:
+    global _last_search_at
+    with _search_lock:
+        wait = 2.0 - (time.time() - _last_search_at)
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            resp = SESSION.get(
+                "https://html.duckduckgo.com/html/",
+                params={"q": query},
+                timeout=10,
+            )
+            _last_search_at = time.time()
+            if resp.status_code == 200:
+                return resp.text
+        except requests.RequestException as exc:
+            STATE.record_error(f"search failed for '{query}': {exc}")
         return ""
 
-def check_gbp_status(business_name: str, location: str) -> str:
-    """# IMPROVED: Heuristic check for Google Business Profile strength."""
-    query = f"{business_name} {location} reviews"
-    html_content = free_google_search(query)
-    # Look for "Google review" or "rating"
-    if "Google review" in html_content:
-        match = re.search(r"([\d\.]+) Google reviews", html_content)
-        if match:
-            count = int(match.group(1).replace(",", ""))
-            if count < 10: return "weak_reviews"
-            return "active"
-    return "not_found"
 
-def identify_project_type(html_text: str) -> Optional[str]:
-    """# IMPROVED: Deep-link scraping for specific high-ticket projects."""
-    projects = {
-        "Commercial": ["commercial", "industrial", "warehouse", "office"],
-        "Luxury": ["luxury", "premium", "high-end", "custom home"],
-        "Government": ["government", "municipal", "public works"]
-    }
-    for p_type, keywords in projects.items():
-        if any(kw in html_text.lower() for kw in keywords):
-            return p_type
-    return "Residential"
+def is_junk_email(addr: str) -> bool:
+    lowered = addr.lower()
+    return any(marker in lowered for marker in CONFIG.junk_email_markers)
+
+
+# IMPROVED: multi-page crawl instead of one homepage regex pass. Most sites
+# put the owner's direct email on /contact or /about, not the homepage.
+CONTACT_PAGE_PATHS = ("", "/contact", "/contact-us", "/about", "/about-us", "/team")
+EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+MAILTO_RE = re.compile(r'mailto:([^"\'\s?]+)', re.IGNORECASE)
+NAME_NEAR_MAILTO_RE = re.compile(
+    r'([A-Z][a-z]+ [A-Z][a-z]+)\s*(?:<[^>]*>)?\s*(?:\n|\s){0,20}<a[^>]*mailto:([^"\'\s?]+)',
+    re.IGNORECASE,
+)
+
+
+def fetch_url(url: str) -> Optional[requests.Response]:
+    """IMPROVED: fallback across https/http and bare/www variants instead of
+    a single unguarded request that silently fails on the first mismatch."""
+    parsed = urlparse(url if "//" in url else f"https://{url}")
+    host = parsed.netloc or parsed.path
+    candidates = [f"https://{host}", f"https://www.{host}", f"http://{host}"]
+    for candidate in dict.fromkeys(candidates):
+        try:
+            resp = SESSION.get(candidate, timeout=CONFIG.scrape_timeout_seconds, allow_redirects=True)
+            if resp.status_code < 400:
+                return resp
+        except requests.RequestException:
+            continue
+    return None
+
+
+def crawl_contact_pages(root_domain: str) -> Tuple[str, List[Tuple[Optional[str], str]]]:
+    """Returns (combined_html_for_pixel_checks, list of (owner_name_or_None, email))."""
+    combined_html = ""
+    found: List[Tuple[Optional[str], str]] = []
+    seen_emails = set()
+    base_resp = fetch_url(root_domain)
+    if not base_resp:
+        return combined_html, found
+    base_url = base_resp.url
+    combined_html += base_resp.text
+
+    for path in CONTACT_PAGE_PATHS:
+        page_url = base_url if path == "" else urljoin(base_url, path)
+        try:
+            if path == "":
+                resp = base_resp
+            else:
+                resp = SESSION.get(page_url, timeout=CONFIG.scrape_timeout_seconds)
+            if resp.status_code >= 400:
+                continue
+        except requests.RequestException:
+            continue
+        text = resp.text
+        if path != "":
+            combined_html += text
+
+        for name, addr in NAME_NEAR_MAILTO_RE.findall(text):
+            addr = addr.strip()
+            if not is_junk_email(addr) and addr.lower() not in seen_emails:
+                found.append((name.strip(), addr))
+                seen_emails.add(addr.lower())
+
+        for addr in MAILTO_RE.findall(text):
+            addr = addr.strip()
+            if not is_junk_email(addr) and addr.lower() not in seen_emails:
+                found.append((None, addr))
+                seen_emails.add(addr.lower())
+
+        for addr in EMAIL_RE.findall(text):
+            if not is_junk_email(addr) and addr.lower() not in seen_emails:
+                found.append((None, addr))
+                seen_emails.add(addr.lower())
+
+    return combined_html, found
+
+
+def prioritize_contact(found: List[Tuple[Optional[str], str]]) -> Tuple[Optional[str], Optional[str]]:
+    """IMPROVED: 3-tier priority — named personal mailto, then role-based
+    local-part (founder/owner/ceo/president), then generic info/contact,
+    instead of a single keyword-or-first-match rule."""
+    if not found:
+        return None, None
+    named = [f for f in found if f[0]]
+    if named:
+        return named[0]
+    role_keywords = ("founder", "owner", "ceo", "president", "principal")
+    role_matches = [f for f in found if any(k in f[1].lower() for k in role_keywords)]
+    if role_matches:
+        return role_matches[0]
+    generic_first = [f for f in found if not any(k in f[1].lower() for k in ("info", "contact", "hello", "support", "sales"))]
+    if generic_first:
+        return generic_first[0]
+    return found[0]
+
 
 def find_founder_name(domain: str, business_name: str) -> Optional[str]:
-    query = f'"{business_name}" founder OR owner OR CEO site:{domain}'
-    html_content = free_google_search(query)
+    query = f'"{business_name}" founder OR owner OR CEO {domain}'
+    html_content = free_web_search(query)
     patterns = [
-        r"(?:Founder|CEO|Owner|President) is ([A-Z][a-z]+ [A-Z][a-z]+)",
-        r"([A-Z][a-z]+ [A-Z][a-z]+), (?:Founder|CEO|Owner|President)",
+        r"(?:Founder|CEO|Owner|President)[,:]?\s+(?:is\s+)?([A-Z][a-z]+ [A-Z][a-z]+)",
+        r"([A-Z][a-z]+ [A-Z][a-z]+),?\s+(?:Founder|CEO|Owner|President)",
     ]
     for p in patterns:
         match = re.search(p, html_content)
-        if match: return match.group(1)
+        if match:
+            return match.group(1)
     return None
+
 
 def find_competitor(location: str, niche: str, current_business: str) -> str:
     query = f"{niche} in {location}"
-    html_content = free_google_search(query)
-    potential_competitors = re.findall(r'aria-label="([^"]+)"', html_content)
-    for comp in potential_competitors:
-        if current_business.lower() not in comp.lower() and len(comp) < 50:
-            return comp
+    html_content = free_web_search(query)
+    potential = re.findall(r'class="result__a"[^>]*>([^<]+)<', html_content)
+    for comp in potential:
+        comp_clean = re.sub(r"\s+", " ", comp).strip()
+        if current_business.lower() not in comp_clean.lower() and 3 < len(comp_clean) < 60:
+            return comp_clean
     return "other local firms"
+
+
+def check_gbp_status(business_name: str, location: str) -> str:
+    """Heuristic-only signal — DDG rarely surfaces a review count directly,
+    so this degrades gracefully to 'not_found' rather than blocking send."""
+    query = f"{business_name} {location} reviews"
+    html_content = free_web_search(query)
+    match = re.search(r"([\d.]+)\s*(?:Google\s*)?reviews", html_content, re.IGNORECASE)
+    if match:
+        try:
+            count = float(match.group(1))
+            return "weak_reviews" if count < 10 else "active"
+        except ValueError:
+            pass
+    return "not_found"
+
+
+def identify_project_type(html_text: str) -> str:
+    projects = {
+        "Commercial": ["commercial", "industrial", "warehouse", "office"],
+        "Luxury": ["luxury", "premium", "high-end", "custom home"],
+        "Government": ["government", "municipal", "public works"],
+    }
+    lowered = html_text.lower()
+    for p_type, keywords in projects.items():
+        if any(kw in lowered for kw in keywords):
+            return p_type
+    return "Residential"
 
 # ---------------------------------------------------------------------------
 # Scraper & Email Engine
@@ -404,8 +811,6 @@ def find_competitor(location: str, niche: str, current_business: str) -> str:
 
 def scrape_domain(candidate: dict) -> dict:
     raw_domain = candidate["domain"]
-    url = f"https://{raw_domain}" if not raw_domain.startswith("http") else raw_domain
-    headers = {"User-Agent": CONFIG.user_agent}
     result = {
         "domain": raw_domain.strip(),
         "has_meta_pixel": False,
@@ -416,157 +821,300 @@ def scrape_domain(candidate: dict) -> dict:
         "founder_name": None,
         "competitor": "a local competitor",
         "gbp_status": "unknown",
-        "project_type": "Residential"
+        "project_type": "Residential",
     }
 
     try:
-        response = requests.get(url, headers=headers, timeout=CONFIG.scrape_timeout_seconds)
-        html_text = response.text
-        result["has_meta_pixel"] = "connect.facebook.net/en_US/fbevents.js" in html_text
-        result["has_google_ads_tag"] = "googletagmanager.com/gtag/js" in html_text
-        
-        # # IMPROVED: Project Type Identification
-        result["project_type"] = identify_project_type(html_text)
+        combined_html, found_contacts = crawl_contact_pages(raw_domain)
+        if not combined_html:
+            result["status"] = "unreachable"
+            return result
 
-        # Email extraction (prioritizing personal)
-        emails = re.findall(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", html_text)
-        if emails:
-            personal = [e for e in emails if any(x in e.lower() for x in ["ceo", "founder", "owner"])]
-            result["contact_email"] = personal[0] if personal else emails[0]
+        result["has_meta_pixel"] = "connect.facebook.net" in combined_html and "fbevents.js" in combined_html
+        result["has_google_ads_tag"] = "googletagmanager.com/gtag/js" in combined_html
+        result["project_type"] = identify_project_type(combined_html)
 
-        result["founder_name"] = find_founder_name(raw_domain, candidate["business_name"])
+        owner_name, contact_email = prioritize_contact(found_contacts)
+        result["contact_email"] = contact_email
+        result["founder_name"] = owner_name or find_founder_name(raw_domain, candidate["business_name"])
         result["competitor"] = find_competitor(candidate["location"], candidate["niche"], candidate["business_name"])
         result["gbp_status"] = check_gbp_status(candidate["business_name"], candidate["location"])
-
         result["status"] = "success"
-    except:
+    except Exception as exc:
+        STATE.record_error(f"scrape_domain failed for {raw_domain}: {exc}")
         result["status"] = "error"
 
     return result
 
-def send_beast_email(recipient_email, domain, business_name, data: dict, step: int = 1):
-    api_key = os.environ.get("BREVO_API_KEY")
-    sender_email = os.environ.get("EMAIL_USER")
-    if not api_key or not sender_email or STATE.email_cap_reached_today: return "failed"
 
-    salutation = f"Hi {data['founder_name'].split()[0]}" if data.get('founder_name') else f"Hi {business_name}"
-    
-    # # IMPROVED: Step 1 (Initial Audit) vs Step 2 (The Nudge)
+def send_beast_email(recipient_email, domain, business_name, data: dict, step: int = 1):
+    api_key = CONFIG.brevo_api_key
+    sender_email = CONFIG.email_user
+    if not api_key or not sender_email:
+        STATE.record_error("send_beast_email: missing BREVO_API_KEY or EMAIL_USER")
+        return "failed"
+    if STATE.email_cap_reached_today:
+        return "failed"
+
+    salutation = f"Hi {data['founder_name'].split()[0]}" if data.get('founder_name') else f"Hi {business_name} team"
+
+    # IMPROVED: the old copy promised a "60-second video walkthrough" that
+    # nothing in this stack generates — a prospect replying YES was a
+    # guaranteed broken promise, which is exactly what turns curiosity into
+    # a spam complaint. The gap the system finds (missing pixel, missing
+    # ads tag, weak reviews vs a named competitor) is real and on the
+    # record from the scrape, so the copy now offers a written breakdown
+    # of that gap — something a human can genuinely send on reply.
     if step == 1:
-        subject = f"Question about {business_name}'s {data['project_type']} projects"
-        audit_line = "I recorded a 60-second walkthrough of your site showing where your ad tracking is leaking money."
-        if data['gbp_status'] == "weak_reviews":
-            audit_line += f" I also noticed {data['competitor']} is outranking you on Google reviews, which is costing you trust."
-        
-        body = f"""
+        subject = f"Question about {business_name}'s {data.get('project_type', 'recent')} projects"
+        gap_line = "your site isn't set up to track which ads actually turn into booked jobs"
+        if data.get('gbp_status') == "weak_reviews":
+            gap_line += f", and {data.get('competitor', 'a nearby competitor')} is outranking you on Google reviews right now"
+        html_body = f"""
         <p>{salutation},</p>
-        <p>I was looking at your {data['project_type']} projects on {domain}. {audit_line}</p>
+        <p>I was looking at your {data.get('project_type', 'recent')} projects on {domain} and noticed {gap_line}.</p>
         <p>We help local leaders plug these gaps to ensure ad spend turns into booked jobs.</p>
-        <p>Would you be open to a 5-minute chat? <strong>Reply YES</strong> and I'll send the video.</p>
+        <p>Would you be open to a 5-minute chat? <strong>Reply YES</strong> and I'll send over a quick written breakdown of what I found.</p>
         <p>Best,<br>{CONFIG.sender_display_name}</p>
+        <p style="font-size:11px;color:#888;">If this isn't useful, reply STOP and I won't follow up again.</p>
         """
+        text_body = (
+            f"{salutation},\n\n"
+            f"I was looking at your {data.get('project_type', 'recent')} projects on {domain} and noticed {gap_line}.\n\n"
+            f"We help local leaders plug these gaps to ensure ad spend turns into booked jobs.\n\n"
+            f"Would you be open to a 5-minute chat? Reply YES and I'll send over a quick written breakdown of what I found.\n\n"
+            f"Best,\n{CONFIG.sender_display_name}\n\n"
+            f"Reply STOP and I won't follow up again."
+        )
     else:
         subject = f"Re: {business_name}'s website tracking"
-        body = f"""
+        html_body = f"""
         <p>{salutation},</p>
         <p>Quickly bringing this to the top of your inbox. Did you see the tracking gap I mentioned on {domain}?</p>
-        <p>I have that video walkthrough ready for you. Just let me know if I should send it over.</p>
+        <p>Happy to send over the written breakdown — just reply YES and I'll get it to you.</p>
         <p>Best,<br>{CONFIG.sender_display_name}</p>
+        <p style="font-size:11px;color:#888;">Reply STOP and I won't follow up again.</p>
         """
+        text_body = (
+            f"{salutation},\n\n"
+            f"Quickly bringing this to the top of your inbox. Did you see the tracking gap I mentioned on {domain}?\n\n"
+            f"Happy to send over the written breakdown — just reply YES and I'll get it to you.\n\n"
+            f"Best,\n{CONFIG.sender_display_name}\n\nReply STOP and I won't follow up again."
+        )
 
     payload = {
         "sender": {"name": CONFIG.sender_display_name, "email": sender_email},
         "to": [{"email": recipient_email}],
         "subject": subject,
-        "htmlContent": body
+        "htmlContent": html_body,
+        "textContent": text_body,
+        # IMPROVED: List-Unsubscribe improves inbox placement and is close
+        # to mandatory for bulk cold outreach under Gmail/Yahoo bulk-sender
+        # rules; the old payload had no unsubscribe signal at all.
+        "headers": {"List-Unsubscribe": f"mailto:{sender_email}?subject=unsubscribe"},
     }
-    
+
     try:
-        res = requests.post("https://api.brevo.com/v3/smtp/email", json=payload, 
-                             headers={"api-key": api_key, "content-type": "application/json"}, timeout=10)
+        res = SESSION.post(
+            "https://api.brevo.com/v3/smtp/email",
+            json=payload,
+            headers={"api-key": api_key, "content-type": "application/json"},
+            timeout=10,
+        )
         if res.status_code < 300:
             STATE.record_email_sent()
             if data.get('founder_name'):
                 notify_me(f"🚀 Beast Match! Sent Step {step} to {data['founder_name']} ({business_name})")
             return "success"
-    except:
-        pass
+        STATE.record_error(f"Brevo send failed ({res.status_code}) for {recipient_email}: {res.text[:200]}")
+    except requests.RequestException as exc:
+        STATE.record_error(f"Brevo send exception for {recipient_email}: {exc}")
     return "failed"
+
+
+def notify_me(message: str):
+    if CONFIG.telegram_bot_token and CONFIG.telegram_chat_id:
+        url = f"https://api.telegram.org/bot{CONFIG.telegram_bot_token}/sendMessage"
+        try:
+            SESSION.post(url, json={"chat_id": CONFIG.telegram_chat_id, "text": message}, timeout=5)
+        except requests.RequestException:
+            pass
 
 # ---------------------------------------------------------------------------
 # Hunt & Automation
 # ---------------------------------------------------------------------------
 
-def run_autonomous_hunt(niche: str, location: str):
+def run_hunt(niche: str, location: str):
+    """Core hunt cycle for one niche/city pair. Used by both the manual
+    dashboard button and the autonomous GlobalHunterThread."""
     STATE.set_status(f"Hunting: {niche} in {location}")
-    
-    # Standard Places API Hunt
+    STATE.last_cycle_started_at = datetime.now().isoformat(timespec="seconds")
+
     url = "https://places.googleapis.com/v1/places:searchText"
-    headers = {"Content-Type": "application/json", "X-Goog-Api-Key": CONFIG.google_places_api_key, 
-               "X-Goog-FieldMask": "places.displayName,places.websiteUri"}
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": CONFIG.google_places_api_key,
+        "X-Goog-FieldMask": "places.displayName,places.websiteUri",
+    }
     payload = {"textQuery": f"{niche} in {location}", "maxResultCount": CONFIG.max_hunt_results}
-    
+
     try:
-        res = requests.post(url, json=payload, headers=headers, timeout=15).json()
+        res = SESSION.post(url, json=payload, headers=headers, timeout=15).json()
         places = res.get("places", [])
-    except:
+    except (requests.RequestException, ValueError) as exc:
+        STATE.record_error(f"Places API failed for {niche}/{location}: {exc}")
         places = []
 
     results_df = pd.DataFrame(columns=["Business Name", "Domain", "Project Type", "Email Status", "Notes"])
 
     for p in places:
+        if STATE.email_cap_reached_today:
+            STATE.set_status("Daily email cap reached — hunting paused")
+            break
         name = p.get("displayName", {}).get("text", "Unknown")
         uri = p.get("websiteUri")
-        if not uri: continue
+        if not uri:
+            continue
         domain = urlparse(uri).netloc.lower()
-        if DEDUP.is_processed(domain): continue
+        if any(agg in domain for agg in CONFIG.aggregator_domains):
+            continue
+        if DEDUP.is_processed(domain):
+            continue
 
         STATE.set_status(f"Beast Scraping: {domain}")
         data = scrape_domain({"domain": domain, "business_name": name, "location": location, "niche": niche})
-        
+        STATE.leads_scraped_total += 1
+        if data["has_meta_pixel"] or data["has_google_ads_tag"]:
+            STATE.leads_with_pixel_total += 1
+
         email_status = "no_email"
         if data["contact_email"]:
-            email_status = send_beast_email(data["contact_email"], domain, name, data, step=1)
-        
-        STORAGE.save_lead(domain, name, data["contact_email"], None, data["has_meta_pixel"], 
-                          data["has_google_ads_tag"], data["status"], "hunt", data["project_type"])
-        DEDUP.mark_processed(domain)
-        STORAGE.mark_email_sent(domain, data["contact_email"] or "none", email_status, step=1)
+            email_domain = data["contact_email"].split("@")[-1]
+            # IMPROVED: MX check before ever hitting Brevo — a domain with
+            # no mail server is a guaranteed hard bounce, and hard bounces
+            # are what get a sending domain rate-limited.
+            if not has_mx_record(email_domain):
+                email_status = "no_mx"
+            # IMPROVED: hold the send until the prospect's local business
+            # hours instead of firing at whatever UTC moment the loop hits.
+            elif not is_within_send_window(location):
+                email_status = "pending_timing"
+            else:
+                email_status = send_beast_email(data["contact_email"], domain, name, data, step=1)
+                time.sleep(CONFIG.email_send_delay_seconds + random.uniform(0, CONFIG.email_send_jitter_seconds))
 
-        new_row = {"Business Name": name, "Domain": domain, "Project Type": data["project_type"], 
+        STORAGE.save_lead(domain, name, data["contact_email"], None, data["has_meta_pixel"],
+                           data["has_google_ads_tag"], data["status"], "hunt", data["project_type"],
+                           founder_name=data["founder_name"], competitor=data["competitor"],
+                           gbp_status=data["gbp_status"], location=location)
+        DEDUP.mark_processed(domain)
+        if data["contact_email"]:
+            STORAGE.mark_email_sent(domain, data["contact_email"], email_status, step=1 if email_status == "success" else 0)
+
+        new_row = {"Business Name": name, "Domain": domain, "Project Type": data["project_type"],
                    "Email Status": email_status, "Notes": f"Founder: {data['founder_name'] or '?'}"}
         results_df = pd.concat([results_df, pd.DataFrame([new_row])], ignore_index=True)
         yield results_df, STATE.snapshot()
 
+    STATE.last_cycle_completed_at = datetime.now().isoformat(timespec="seconds")
     STATE.set_status("Idle")
+    backup_sync_now()  # IMPROVED: snapshot state to GitHub after every cycle
     yield results_df, STATE.snapshot()
 
+
+def run_autonomous_hunt(niche: str, location: str):
+    """Manual dashboard entry point — thin wrapper kept for UI compatibility."""
+    yield from run_hunt(niche, location)
+
+
 def run_follow_up_cycle():
-    """# IMPROVED: Background cycle to send follow-up nudges."""
     leads = STORAGE.get_follow_up_leads(days_delay=3)
     for lead in leads:
-        if STATE.email_cap_reached_today: break
-        # Minimal data for follow-up
+        if STATE.email_cap_reached_today:
+            break
         data = {"founder_name": None, "project_type": lead['project_type']}
         outcome = send_beast_email(lead['contact_email'], lead['domain'], lead['business_name'], data, step=2)
-        STORAGE.mark_email_sent(lead['domain'], lead['contact_email'], outcome, step=2)
-        time.sleep(CONFIG.email_send_delay_seconds)
+        STORAGE.mark_email_sent(lead['domain'], lead['contact_email'], outcome, step=2 if outcome == "success" else lead['follow_up_step'])
+        time.sleep(CONFIG.email_send_delay_seconds + random.uniform(0, CONFIG.email_send_jitter_seconds))
 
-def automation_loop():
+
+def global_hunter_loop():
+    """# IMPROVED: this is the piece that was missing entirely. render.yaml
+    ships AUTOMATED_NICHES and AUTOMATED_CITIES, and the module docstring
+    even calls it out, but the old app.py never rotated through them — only
+    the manual dashboard button ever triggered a hunt. This loop walks every
+    (niche, city) pair, sleeping loop_interval_seconds between pairs, and
+    wraps to the start once it exhausts the matrix."""
+    niches = CONFIG.automated_niches
+    cities = CONFIG.automated_cities
+    if not niches or not cities:
+        logger.info("GlobalHunterThread idle — AUTOMATED_NICHES/AUTOMATED_CITIES not set.")
+        return
+
+    combos = [(n, c) for n in niches for c in cities]
+    logger.info(f"GlobalHunterThread starting with {len(combos)} niche x city combinations.")
+
+    while True:
+        if STATE.email_cap_reached_today:
+            time.sleep(CONFIG.loop_interval_seconds)
+            continue
+        idx = STATE.current_niche_city_index % len(combos)
+        niche, city = combos[idx]
+        try:
+            for _ in run_hunt(niche, city):
+                pass
+        except Exception as exc:
+            STATE.record_error(f"GlobalHunterThread cycle failed for {niche}/{city}: {exc}")
+        STATE.current_niche_city_index += 1
+        time.sleep(CONFIG.loop_interval_seconds)
+
+
+def follow_up_loop():
     while True:
         try:
             run_follow_up_cycle()
-        except Exception as e:
-            logger.error(f"Follow-up error: {e}")
+        except Exception as exc:
+            STATE.record_error(f"Follow-up cycle error: {exc}")
         time.sleep(CONFIG.loop_interval_seconds)
+
+
+def run_pending_timing_dispatch():
+    """IMPROVED: sweeps leads scraped outside their city's send window
+    (email_status='pending_timing') and dispatches the ones whose local
+    clock has since entered business hours. Runs on a short cycle (5 min)
+    since the point is to catch the window opening promptly."""
+    for lead in STORAGE.get_pending_timing_leads():
+        location = lead.get("location") or ""
+        if not is_within_send_window(location):
+            continue
+        if STATE.email_cap_reached_today:
+            break
+        data = {
+            "founder_name": lead.get("founder_name"),
+            "project_type": lead.get("project_type"),
+            "competitor": lead.get("competitor"),
+            "gbp_status": lead.get("gbp_status"),
+        }
+        outcome = send_beast_email(lead["contact_email"], lead["domain"], lead["business_name"], data, step=1)
+        STORAGE.mark_email_sent(lead["domain"], lead["contact_email"], outcome, step=1 if outcome == "success" else 0)
+        time.sleep(CONFIG.email_send_delay_seconds + random.uniform(0, CONFIG.email_send_jitter_seconds))
+
+
+def pending_timing_loop():
+    while True:
+        try:
+            run_pending_timing_dispatch()
+        except Exception as exc:
+            STATE.record_error(f"Pending-timing dispatch error: {exc}")
+        time.sleep(300)
 
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
 
 def build_ui():
-    with gr.Blocks(title="Growth Pulse Beast v2") as demo:
-        gr.Markdown("# 🚀 Growth Pulse: Beast Conversion Dominator (Phase 2)")
+    with gr.Blocks(title="Growth Pulse Beast v4") as demo:
+        gr.Markdown("# 🚀 Growth Pulse: Beast Conversion Dominator (Phase 4)")
         with gr.Row():
             with gr.Column():
                 niche_input = gr.Textbox(label="Niche", value="Roofing")
@@ -576,9 +1124,18 @@ def build_ui():
                 status_box = gr.JSON(label="Vital Signs", value=STATE.snapshot())
         results_table = gr.DataFrame(label="Live Beast Stream")
         hunt_btn.click(run_autonomous_hunt, inputs=[niche_input, loc_input], outputs=[results_table, status_box])
-        demo.load(lambda: STATE.snapshot(), outputs=status_box)
+
+        # IMPROVED: gr.Timer replaces the fragile demo.load(fn, every=N)
+        # pattern, which raises a validation error on several recent Gradio
+        # releases because `every` expects a Timer/None, not a bare int.
+        refresh_timer = gr.Timer(5)
+        refresh_timer.tick(lambda: STATE.snapshot(), outputs=status_box)
     return demo
 
+
 if __name__ == "__main__":
-    threading.Thread(target=automation_loop, daemon=True).start()
+    threading.Thread(target=global_hunter_loop, daemon=True, name="GlobalHunterThread").start()
+    threading.Thread(target=follow_up_loop, daemon=True, name="FollowUpThread").start()
+    threading.Thread(target=pending_timing_loop, daemon=True, name="PendingTimingThread").start()
+    threading.Thread(target=backup_loop, daemon=True, name="BackupThread").start()
     build_ui().launch(server_name="0.0.0.0", server_port=7860)
