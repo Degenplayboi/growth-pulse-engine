@@ -56,6 +56,33 @@ Architecture:
   email copy — nothing in this stack generates that video, so a prospect
   replying YES was a guaranteed broken promise and a spam-complaint risk.
   Replaced with a claim the system can actually back up on reply.
+
+# BEAST PHASE 5 IMPROVEMENTS (this pass):
+- FIXED: root cause of "Overpass keeps failing on Render" — Render's free
+  tier has no outbound IPv6 route, and Overpass (among other hosts) publishes
+  both A and AAAA DNS records; the old code let Python try the IPv6 address
+  first and fail with "Network is unreachable" before ever reaching IPv4.
+  A process-wide urllib3 monkeypatch forces IPv4-only resolution, fixing
+  this for every outbound call in the file, not only Overpass.
+- IMPROVED: Overpass now rotates across four public mirrors with a short
+  per-mirror timeout instead of hammering a single overloaded instance —
+  overpass-api.de alone regularly answers 429/504 under normal load,
+  independent of any networking issue.
+- IMPROVED: Overpass/OSM discovery no longer hard-depends on a Geoapify key
+  for geocoding — falls back to Nominatim (OSM's own free, keyless geocoder)
+  so raw OSM discovery keeps working on a zero-paid-key deployment.
+- IMPROVED: OVERPASS_NICHE_TAGS now maps each trade to every OSM tagging
+  style actually in use (craft=, shop=, office=) instead of one guess per
+  niche, and adds plumbing/painting/carpentry coverage — this is the direct
+  lever for "find more real local trades" from a source that costs no quota.
+- IMPROVED: every discovery source's per-cycle and cumulative contribution
+  is now counted and logged (hunt_candidates), so it's possible to see which
+  source is actually producing candidates for a given niche/city instead of
+  only ever seeing a combined total.
+- IMPROVED: Gradio dashboard rebuilt — metric cards instead of a raw JSON
+  dump, a Discovery Sources tab showing the breakdown above, a live log tail
+  backed by an in-memory ring buffer, and a read-only Automation tab
+  summarizing what the autonomous rotation is actually configured to do.
 """
 
 import os
@@ -65,9 +92,11 @@ import json
 import time
 import base64
 import random
+import socket
 import sqlite3
 import logging
 import threading
+import collections
 from datetime import datetime, date, timedelta
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple
@@ -86,6 +115,32 @@ except ImportError:
     _DNS_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
+# BEAST PHASE 5 - ROOT-CAUSE FIX: "Network is unreachable" on Render free tier
+# ---------------------------------------------------------------------------
+# Render's free web tier has no outbound IPv6 route. Overpass, and a growing
+# number of other hosts, publish both an A (IPv4) and AAAA (IPv6) DNS record.
+# Python's socket layer tries the addresses getaddrinfo() returns in order;
+# when the first one it tries is the AAAA record, the connect() call fails
+# immediately with OSError: [Errno 101] Network is unreachable. This isn't a
+# retry-able flake - every call to a dual-stack host fails the same way,
+# which is exactly the "Overpass keeps failing" symptom reported. It affects
+# every outbound call in this file (Overpass, Geoapify, DuckDuckGo, Brevo,
+# GitHub, Telegram), not just Overpass; those calls happened to fail less
+# often only because those hosts happen not to advertise AAAA records today.
+#
+# Fix: force urllib3 (which `requests` sits on top of) to only resolve
+# IPv4 addresses, process-wide. This is a two-line monkeypatch of urllib3's
+# address-family selector and needs no per-call code changes anywhere else.
+# ---------------------------------------------------------------------------
+
+import urllib3.util.connection as _urllib3_cn
+
+def _force_ipv4_only():
+    return socket.AF_INET
+
+_urllib3_cn.allowed_gai_family = _force_ipv4_only
+
+# ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 
@@ -94,6 +149,29 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(threadName)s | %(message)s",
 )
 logger = logging.getLogger("growth_pulse")
+
+
+# IMPROVED: in-memory ring buffer of the last N log lines, surfaced live on
+# the Gradio dashboard so "is this actually working" has a real answer
+# without needing to open the Render log viewer in another tab.
+class _RingBufferHandler(logging.Handler):
+    def __init__(self, capacity: int = 300):
+        super().__init__()
+        self.buffer = collections.deque(maxlen=capacity)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.buffer.append(self.format(record))
+        except Exception:
+            pass
+
+    def tail_text(self) -> str:
+        return "\n".join(self.buffer) if self.buffer else "No log activity yet."
+
+
+LOG_RING = _RingBufferHandler()
+LOG_RING.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%H:%M:%S"))
+logging.getLogger().addHandler(LOG_RING)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -363,6 +441,14 @@ class EngineState:
         # IMPROVED: Geoapify free-tier daily quota tracking.
         self.geoapify_calls_today: int = 0
         self.geoapify_cap_reached_today: bool = False
+        # IMPROVED: per-source discovery counters (cumulative, process
+        # lifetime) so the dashboard can answer "which discovery source is
+        # actually finding businesses" instead of a single opaque total.
+        self.candidates_from_geoapify_total: int = 0
+        self.candidates_from_overpass_total: int = 0
+        self.candidates_from_ddg_total: int = 0
+        self.overpass_mirror_failures_total: int = 0
+        self.last_hunt_source_breakdown: Dict[str, int] = {}
 
     def _roll_daily_counter_if_needed(self) -> None:
         today = date.today()
@@ -417,6 +503,22 @@ class EngineState:
             self.geoapify_calls_today += 1
             return True
 
+    def record_hunt_sources(self, geoapify: int, overpass: int, ddg: int) -> None:
+        """IMPROVED: called once per hunt cycle with how many candidates each
+        discovery source contributed, so the dashboard shows which sources
+        are actually producing leads instead of a single opaque total."""
+        with self._lock:
+            self.candidates_from_geoapify_total += geoapify
+            self.candidates_from_overpass_total += overpass
+            self.candidates_from_ddg_total += ddg
+            self.last_hunt_source_breakdown = {
+                "geoapify": geoapify, "overpass": overpass, "ddg": ddg,
+            }
+
+    def record_overpass_mirror_failure(self) -> None:
+        with self._lock:
+            self.overpass_mirror_failures_total += 1
+
     def snapshot(self) -> dict:
         with self._lock:
             self._roll_daily_counter_if_needed()
@@ -433,6 +535,11 @@ class EngineState:
                 "last_cycle_started_at": self.last_cycle_started_at,
                 "last_cycle_completed_at": self.last_cycle_completed_at,
                 "last_error": self.last_error,
+                "last_hunt_source_breakdown": self.last_hunt_source_breakdown,
+                "candidates_from_geoapify_total": self.candidates_from_geoapify_total,
+                "candidates_from_overpass_total": self.candidates_from_overpass_total,
+                "candidates_from_ddg_total": self.candidates_from_ddg_total,
+                "overpass_mirror_failures_total": self.overpass_mirror_failures_total,
             }
 
 
@@ -649,7 +756,7 @@ def backup_loop() -> None:
             backup_sync_now()
         except Exception as exc:
             STATE.record_error(f"Backup loop error: {exc}")
-      
+
 # ---------------------------------------------------------------------------
 # IMPROVED: Search intelligence — DuckDuckGo HTML-lite instead of raw Google
 # Google's public search HTML returns a CAPTCHA/consent wall to almost any
@@ -724,17 +831,33 @@ NICHE_CATEGORY_MAP: Dict[str, str] = {
 # free Overpass API reaches these without spending Geoapify's daily credits.
 # Real caveat, stated plainly: OSM's coverage of solo-operator trade
 # businesses (no storefront) is generally sparse — this widens the net, it
-# doesn't fill it. Foundation repair and solar installers still have no
-# reasonable OSM tag and go straight to DDG discovery.
+# doesn't fill it. Foundation repair, solar installers, and pool builders
+# still have no reliable OSM tag and go straight to DDG discovery.
+#
+# IMPROVED (this pass): each niche now maps to *every* tag combination OSM
+# actually uses for that trade instead of one guess. craft=* covers the
+# tradesperson/workshop mapping style; shop=* and office=* cover the
+# storefront/registered-company mapping style. Mappers use both inconsistently
+# for the same real-world business, so querying only one style was silently
+# skipping real, tagged local businesses. This is the main lever for "find
+# more real local trades" — broader tag coverage directly means more
+# candidates out of a source that costs no quota and needs no key.
 OVERPASS_NICHE_TAGS: Dict[str, List[Tuple[str, str]]] = {
     "roofing": [("craft", "roofer")],
     "roofer": [("craft", "roofer")],
-    "electrician": [("craft", "electrician")],
-    "electrical": [("craft", "electrician")],
+    "electrician": [("craft", "electrician"), ("shop", "electrical")],
+    "electrical": [("craft", "electrician"), ("shop", "electrical")],
     "hvac": [("craft", "hvac")],
-    "landscap": [("craft", "gardener")],
-    "builder": [("craft", "builder")],
-    "home builder": [("craft", "builder")],
+    "heating": [("craft", "hvac")],
+    "landscap": [("craft", "gardener"), ("shop", "garden_centre")],
+    "builder": [("craft", "builder"), ("office", "construction_company")],
+    "home builder": [("craft", "builder"), ("office", "construction_company")],
+    "construction": [("craft", "builder"), ("office", "construction_company")],
+    "plumb": [("craft", "plumber"), ("shop", "plumbing")],
+    "painter": [("craft", "painter")],
+    "painting": [("craft", "painter")],
+    "carpenter": [("craft", "carpenter")],
+    "carpentry": [("craft", "carpenter")],
 }
 
 _geocode_cache: Dict[str, Optional[dict]] = {}
@@ -760,37 +883,83 @@ def map_niche_to_overpass_tags(niche: str) -> List[Tuple[str, str]]:
     return tags
 
 
+# IMPROVED: Nominatim (OSM's own free geocoder) as a fallback when Geoapify
+# has no key set or has hit its daily quota — this is what removes Overpass's
+# hard dependency on a Geoapify key entirely, so raw OSM discovery keeps
+# working even on a bare deployment with zero paid-tier keys configured.
+# Nominatim's usage policy caps public requests at 1/sec and requires an
+# identifying User-Agent; both are respected below. No place_id is returned
+# (that's a Geoapify-specific concept), only lat/lon, which is all Overpass
+# needs for its "around" radius filter.
+_last_nominatim_at = 0.0
+_nominatim_lock = threading.Lock()
+
+
+def nominatim_geocode_record(location: str) -> Optional[dict]:
+    global _last_nominatim_at
+    with _nominatim_lock:
+        wait = 1.1 - (time.time() - _last_nominatim_at)
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            resp = SESSION.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={"q": location, "format": "json", "limit": 1},
+                headers={"User-Agent": f"GrowthPulse/1.0 ({CONFIG.sender_display_name})"},
+                timeout=10,
+            )
+            _last_nominatim_at = time.time()
+            resp.raise_for_status()
+            results = resp.json()
+            if results:
+                return {"place_id": None, "lat": results[0].get("lat"), "lon": results[0].get("lon")}
+            return None
+        except (requests.RequestException, ValueError, IndexError, KeyError) as exc:
+            STATE.record_error(f"Nominatim geocode failed for '{location}': {exc}")
+            return None
+
+
 def geoapify_geocode_record(location: str) -> Optional[dict]:
     """Resolves a city string to {"place_id":..., "lat":..., "lon":...},
     cached for the life of the process so repeated hunt cycles don't
     re-geocode the same city. Backs both the Geoapify Places filter and the
-    Overpass "around" radius query."""
+    Overpass "around" radius query.
+
+    IMPROVED: tries Geoapify first (needed for place_id, which the Places
+    category search requires), then falls back to Nominatim when there's no
+    Geoapify key or its daily quota is exhausted — Overpass discovery only
+    needs lat/lon, so it keeps working either way."""
     with _geocode_lock:
         if location in _geocode_cache:
             return _geocode_cache[location]
-    if not CONFIG.geoapify_api_key or not STATE.try_reserve_geoapify_call():
-        return None
-    try:
-        resp = SESSION.get(
-            "https://api.geoapify.com/v1/geocode/search",
-            params={"text": location, "type": "city", "format": "json", "apiKey": CONFIG.geoapify_api_key},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        results = resp.json().get("results", [])
-        record = None
-        if results:
-            record = {
-                "place_id": results[0].get("place_id"),
-                "lat": results[0].get("lat"),
-                "lon": results[0].get("lon"),
-            }
-        with _geocode_lock:
-            _geocode_cache[location] = record
-        return record
-    except (requests.RequestException, ValueError, IndexError, KeyError) as exc:
-        STATE.record_error(f"Geoapify geocode failed for '{location}': {exc}")
-        return None
+
+    record = None
+    if CONFIG.geoapify_api_key and STATE.try_reserve_geoapify_call():
+        try:
+            resp = SESSION.get(
+                "https://api.geoapify.com/v1/geocode/search",
+                params={"text": location, "type": "city", "format": "json", "apiKey": CONFIG.geoapify_api_key},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            results = resp.json().get("results", [])
+            if results:
+                record = {
+                    "place_id": results[0].get("place_id"),
+                    "lat": results[0].get("lat"),
+                    "lon": results[0].get("lon"),
+                }
+        except (requests.RequestException, ValueError, IndexError, KeyError) as exc:
+            STATE.record_error(f"Geoapify geocode failed for '{location}': {exc}")
+
+    if record is None:
+        record = nominatim_geocode_record(location)
+        if record:
+            logger.info(f"Geocoded '{location}' via Nominatim fallback (no Geoapify place_id available).")
+
+    with _geocode_lock:
+        _geocode_cache[location] = record
+    return record
 
 
 def geoapify_geocode_city(location: str) -> Optional[str]:
@@ -850,10 +1019,12 @@ def geoapify_places_search(category: str, location: str, limit: int) -> List[Dic
         )
         resp.raise_for_status()
         features = resp.json().get("features", [])
-        return [
+        results = [
             {"name": f["properties"].get("name"), "place_id": f["properties"].get("place_id")}
             for f in features if f.get("properties", {}).get("name")
         ]
+        logger.info(f"Geoapify places search '{category}'/{location} -> {len(results)} raw result(s).")
+        return results
     except (requests.RequestException, ValueError, KeyError) as exc:
         STATE.record_error(f"Geoapify places search failed for {category}/{location}: {exc}")
         return []
@@ -895,16 +1066,64 @@ def ddg_find_website_for_business(name: str, location: str) -> Optional[str]:
     return None
 
 
+# IMPROVED: multiple public Overpass mirrors instead of hardcoding
+# overpass-api.de. The primary instance is the most heavily loaded public
+# Overpass server in existence and frequently answers with 429/504 under
+# load, independent of any Render-specific networking issue. Rotating
+# through mirrors — each with a short, fast-failing timeout rather than one
+# long timeout on a single host — means a single overloaded/unreachable
+# mirror costs a few seconds, not the whole hunt cycle.
+OVERPASS_MIRRORS: List[str] = [
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.osm.rambler.ru/cgi/interpreter",
+]
+# Small process-wide rotation offset so repeated cycles don't always hammer
+# the same mirror first — spreads load across the mirror list over time.
+_overpass_rotation = {"offset": 0}
+_overpass_rotation_lock = threading.Lock()
+
+
+def _next_overpass_order() -> List[str]:
+    with _overpass_rotation_lock:
+        offset = _overpass_rotation["offset"] % len(OVERPASS_MIRRORS)
+        _overpass_rotation["offset"] += 1
+    return OVERPASS_MIRRORS[offset:] + OVERPASS_MIRRORS[:offset]
+
+
+def overpass_query(query: str, timeout_per_mirror: int = 12) -> Optional[dict]:
+    """IMPROVED: tries each Overpass mirror in turn with a short per-mirror
+    timeout, logging exactly which mirror served the request (or why each
+    one failed) so mirror health is visible in the live log instead of a
+    single opaque "Overpass failed" error."""
+    for mirror in _next_overpass_order():
+        try:
+            resp = SESSION.post(mirror, data={"data": query}, timeout=timeout_per_mirror)
+            if resp.status_code == 200:
+                logger.info(f"Overpass OK via {mirror}")
+                return resp.json()
+            logger.warning(f"Overpass mirror {mirror} returned HTTP {resp.status_code} — trying next mirror.")
+            STATE.record_overpass_mirror_failure()
+        except (requests.RequestException, ValueError) as exc:
+            logger.warning(f"Overpass mirror {mirror} unreachable ({exc}) — trying next mirror.")
+            STATE.record_overpass_mirror_failure()
+    STATE.record_error("All Overpass mirrors failed or timed out for this query.")
+    return None
+
+
 def overpass_business_search(niche: str, location: str, limit: int) -> List[Dict]:
-    """IMPROVED: queries raw OSM craft= tags via the free Overpass API — no
-    key, no daily quota, and it reaches trades Geoapify's category list
-    doesn't expose. Coverage is still genuinely sparse for solo-operator
-    trades with no storefront; this widens the net, it doesn't fill it."""
+    """IMPROVED: queries raw OSM craft=/shop=/office= tags via the free
+    Overpass API (rotating across mirrors, see overpass_query) — no key, no
+    daily quota, and it reaches trades Geoapify's category list doesn't
+    expose. Coverage is still genuinely sparse for solo-operator trades with
+    no storefront; this widens the net, it doesn't fill it."""
     tags = map_niche_to_overpass_tags(niche)
     if not tags:
         return []
     record = geoapify_geocode_record(location)
     if not record or not record.get("lat") or not record.get("lon"):
+        logger.info(f"Overpass skipped for {niche}/{location} — no geocode available (needs GEOAPIFY_API_KEY).")
         return []
     lat, lon = record["lat"], record["lon"]
     radius_m = 20000
@@ -914,13 +1133,10 @@ def overpass_business_search(niche: str, location: str, limit: int) -> List[Dict
         for k, v in tags
     )
     query = f"[out:json][timeout:20];({clauses});out center tags {limit};"
-    try:
-        resp = SESSION.post("https://overpass-api.de/api/interpreter", data={"data": query}, timeout=25)
-        resp.raise_for_status()
-        elements = resp.json().get("elements", [])
-    except (requests.RequestException, ValueError) as exc:
-        STATE.record_error(f"Overpass query failed for {niche}/{location}: {exc}")
+    payload = overpass_query(query)
+    if payload is None:
         return []
+    elements = payload.get("elements", [])
 
     out: List[Dict] = []
     for el in elements:
@@ -935,6 +1151,8 @@ def overpass_business_search(niche: str, location: str, limit: int) -> List[Dict
             out.append({"name": name, "uri": website})
         if len(out) >= limit:
             break
+    logger.info(f"Overpass found {len(out)} candidate(s) with website for {niche}/{location} "
+                f"(from {len(elements)} raw OSM element(s)).")
     return out
 
 
@@ -968,15 +1186,24 @@ def ddg_business_discovery(niche: str, location: str, limit: int) -> List[Dict]:
             out.append({"name": name, "uri": url})
             if len(out) >= limit:
                 break
+    logger.info(f"DDG business discovery '{niche}'/{location} -> {len(out)} candidate(s).")
     return out
 
 
 def hunt_candidates(niche: str, location: str) -> List[Dict]:
     """Returns a list of {"name":..., "uri":...} candidate businesses.
     Tries, in order: Geoapify category (best precision, quota-limited),
-    Overpass craft-tag lookup (free, no quota, narrower coverage), then
-    DuckDuckGo business discovery (widest coverage, lowest precision)."""
+    Overpass craft/shop/office-tag lookup (free, no quota, narrower
+    coverage), then DuckDuckGo business discovery (widest coverage, lowest
+    precision).
+
+    IMPROVED: each source's contribution is counted and logged, and pushed
+    into STATE for the dashboard — this is what answers "which discovery
+    method is actually finding businesses for this niche" instead of only
+    ever seeing a combined total."""
     candidates: List[Dict] = []
+    from_geoapify = from_overpass = from_ddg = 0
+
     category = map_niche_to_category(niche)
     if category and CONFIG.geoapify_api_key:
         places = geoapify_places_search(category, location, CONFIG.max_hunt_results)
@@ -993,10 +1220,23 @@ def hunt_candidates(niche: str, location: str) -> List[Dict]:
                 website = ddg_find_website_for_business(name, location)
             if website:
                 candidates.append({"name": name, "uri": website})
+                from_geoapify += 1
+
     if len(candidates) < CONFIG.max_hunt_results:
-        candidates.extend(overpass_business_search(niche, location, CONFIG.max_hunt_results - len(candidates)))
+        overpass_results = overpass_business_search(niche, location, CONFIG.max_hunt_results - len(candidates))
+        candidates.extend(overpass_results)
+        from_overpass = len(overpass_results)
+
     if len(candidates) < CONFIG.max_hunt_results:
-        candidates.extend(ddg_business_discovery(niche, location, CONFIG.max_hunt_results - len(candidates)))
+        ddg_results = ddg_business_discovery(niche, location, CONFIG.max_hunt_results - len(candidates))
+        candidates.extend(ddg_results)
+        from_ddg = len(ddg_results)
+
+    STATE.record_hunt_sources(from_geoapify, from_overpass, from_ddg)
+    logger.info(
+        f"hunt_candidates '{niche}' / '{location}' -> {len(candidates)} total "
+        f"(geoapify={from_geoapify}, overpass={from_overpass}, ddg={from_ddg})"
+    )
     return candidates
 
 
@@ -1352,12 +1592,12 @@ def run_hunt(niche: str, location: str):
         new_row = {"Business Name": name, "Domain": domain, "Project Type": data["project_type"],
                    "Email Status": email_status, "Notes": f"Founder: {data['founder_name'] or '?'}"}
         results_df = pd.concat([results_df, pd.DataFrame([new_row])], ignore_index=True)
-        yield results_df, STATE.snapshot()
+        yield results_df
 
     STATE.last_cycle_completed_at = datetime.now().isoformat(timespec="seconds")
     STATE.set_status("Idle")
     backup_sync_now()  # IMPROVED: snapshot state to GitHub after every cycle
-    yield results_df, STATE.snapshot()
+    yield results_df
 
 
 def run_autonomous_hunt(niche: str, location: str):
@@ -1449,25 +1689,181 @@ def pending_timing_loop():
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
+# IMPROVED (this pass): full rebuild. The old dashboard was a single raw
+# gr.JSON blob of internal state next to two bare textboxes — functional,
+# but unreadable at a glance and gave no way to tell *which* discovery
+# source or send-gate was actually doing anything. This version:
+#   - replaces the JSON dump with labeled metric cards
+#   - adds a discovery-source breakdown so "is Overpass working" has a
+#     direct answer instead of an inferred one
+#   - adds a live log tail (backed by LOG_RING) so operational visibility
+#     doesn't require opening the Render log viewer separately
+#   - separates manual hunting, health/observability, and the read-only
+#     autonomous-mode configuration into tabs instead of one crowded page
+# ---------------------------------------------------------------------------
+
+RESULTS_COLUMNS = ["Business Name", "Domain", "Project Type", "Email Status", "Notes"]
+
+
+def _status_card_values():
+    """Returns the flat tuple of values for the top metric-card row, in the
+    same order the cards are declared below."""
+    s = STATE.snapshot()
+    cap_line = f"{s['emails_dispatched_today']} / {s['todays_cap']}"
+    if s["email_cap_reached_today"]:
+        cap_line += " (cap reached)"
+    leads_line = f"{s['leads_scraped_total']}"
+    # IMPROVED: leads_with_pixel_total counts leads that ALREADY have a Meta
+    # Pixel / Google Ads tag — the opposite of the outreach opportunity. The
+    # card now shows the actual pitch-worthy gap (scraped minus already-tracked)
+    # instead of a number that reads backwards from what it's labeled.
+    gap_count = max(s["leads_scraped_total"] - s["leads_with_pixel_total"], 0)
+    gap_line = f"{gap_count}"
+    errors_line = f"{s['errors_total']}"
+    last_error = s["last_error"] or "—"
+    return s["status"], cap_line, leads_line, gap_line, errors_line, last_error
+
+
+def _source_breakdown_df():
+    s = STATE.snapshot()
+    last = s.get("last_hunt_source_breakdown") or {}
+    return pd.DataFrame(
+        {
+            "Source": ["Geoapify (Places API)", "Overpass (free OSM)", "DuckDuckGo (fallback)"],
+            "Last Cycle": [last.get("geoapify", 0), last.get("overpass", 0), last.get("ddg", 0)],
+            "Total (since restart)": [
+                s["candidates_from_geoapify_total"],
+                s["candidates_from_overpass_total"],
+                s["candidates_from_ddg_total"],
+            ],
+        }
+    )
+
+
+def _health_text():
+    s = STATE.snapshot()
+    lines = [
+        f"Last cycle started:   {s['last_cycle_started_at'] or '—'}",
+        f"Last cycle completed: {s['last_cycle_completed_at'] or '—'}",
+        f"Overpass mirror failures (total): {s['overpass_mirror_failures_total']}",
+        f"Geoapify calls today: {s['geoapify_calls_today']} (cap reached: {s['geoapify_cap_reached_today']})",
+        f"GitHub backup: {'enabled' if GITHUB_BACKUP.enabled else 'disabled — set GITHUB_TOKEN + GITHUB_BACKUP_REPO'}",
+    ]
+    return "\n".join(lines)
+
+
+def _automation_summary():
+    niches = CONFIG.automated_niches
+    cities = CONFIG.automated_cities
+    if not niches or not cities:
+        return "Autonomous rotation is **off** — set `AUTOMATED_NICHES` and `AUTOMATED_CITIES` in Render to enable it."
+    combos = len(niches) * len(cities)
+    hours_per_cycle = round(CONFIG.loop_interval_seconds / 60, 1)
+    return (
+        f"**Autonomous rotation is on.**\n\n"
+        f"- {len(niches)} niche(s) × {len(cities)} cit(ies) = **{combos} combinations** in rotation\n"
+        f"- ~{hours_per_cycle} min between each hunt cycle "
+        f"(full rotation takes roughly {round(combos * hours_per_cycle / 60, 1)} hours)\n"
+        f"- Send window: {CONFIG.send_window_start_hour}:00–{CONFIG.send_window_end_hour}:00, local to each city\n"
+        f"- Daily email cap: {CONFIG.daily_email_cap} "
+        f"(warm-up ramp: {CONFIG.warmup_start_cap} → {CONFIG.daily_email_cap} over {CONFIG.warmup_days} days)\n\n"
+        f"Niches: {', '.join(niches)}\n\n"
+        f"Cities: {', '.join(cities)}"
+    )
+
+
+CARD_CSS = """
+.metric-card textarea, .metric-card input {
+    font-size: 1.05rem !important;
+    text-align: center !important;
+    font-weight: 600 !important;
+}
+.metric-card label {
+    text-align: center !important;
+    width: 100% !important;
+}
+#gp-log textarea {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace !important;
+    font-size: 0.8rem !important;
+}
+"""
+
 
 def build_ui():
-    with gr.Blocks(title="Growth Pulse Beast v4") as demo:
-        gr.Markdown("# 🚀 Growth Pulse: Beast Conversion Dominator (Phase 4)")
+    with gr.Blocks(title="Growth Pulse", theme=gr.themes.Soft(primary_hue="blue", secondary_hue="slate"), css=CARD_CSS) as demo:
+        gr.Markdown(
+            "# Growth Pulse\n"
+            "Autonomous local-trade lead generation — discovery, enrichment, and outreach in one pipeline."
+        )
+
+        # --- Top metric strip: at-a-glance system health -------------------
         with gr.Row():
-            with gr.Column():
-                niche_input = gr.Textbox(label="Niche", value="Roofing")
-                loc_input = gr.Textbox(label="Location", value="Miami")
-                hunt_btn = gr.Button("🔥 Launch Beast Hunt", variant="primary")
-            with gr.Column():
-                status_box = gr.JSON(label="Vital Signs", value=STATE.snapshot())
-        results_table = gr.DataFrame(label="Live Beast Stream")
-        hunt_btn.click(run_autonomous_hunt, inputs=[niche_input, loc_input], outputs=[results_table, status_box])
+            status_card = gr.Textbox(label="Status", interactive=False, elem_classes="metric-card")
+            emails_card = gr.Textbox(label="Emails sent today / cap", interactive=False, elem_classes="metric-card")
+            leads_card = gr.Textbox(label="Leads scraped (total)", interactive=False, elem_classes="metric-card")
+            pixel_card = gr.Textbox(label="Leads with no ad tracking (the pitch)", interactive=False, elem_classes="metric-card")
+            errors_card = gr.Textbox(label="Errors (total)", interactive=False, elem_classes="metric-card")
+        last_error_box = gr.Textbox(label="Most recent error", interactive=False)
+
+        with gr.Tabs():
+            # --- Manual hunt ------------------------------------------------
+            with gr.Tab("Manual Hunt"):
+                gr.Markdown(
+                    "Runs one hunt cycle immediately for the niche/city below, in addition to whatever "
+                    "the autonomous rotation is doing in the background. Results stream in as each "
+                    "candidate is scraped."
+                )
+                with gr.Row():
+                    niche_input = gr.Textbox(label="Niche", value="Roofing", placeholder="e.g. Roofing, HVAC, Electricians")
+                    loc_input = gr.Textbox(label="Location", value="Miami FL", placeholder="City, State/Country")
+                    hunt_btn = gr.Button("Launch Hunt", variant="primary", scale=0)
+                results_table = gr.DataFrame(
+                    label="Live results",
+                    value=pd.DataFrame(columns=RESULTS_COLUMNS),
+                    wrap=True,
+                )
+
+            # --- Discovery sources / health ---------------------------------
+            with gr.Tab("Discovery Sources"):
+                gr.Markdown(
+                    "Which free discovery method is actually producing candidates. If Overpass shows "
+                    "0 for a niche, check the Live Log tab for mirror errors — it falls back to "
+                    "DuckDuckGo automatically either way, so hunting keeps running."
+                )
+                source_table = gr.DataFrame(value=_source_breakdown_df(), interactive=False)
+                health_box = gr.Textbox(label="System health", value=_health_text(), interactive=False, lines=6)
+
+            # --- Live log -----------------------------------------------------
+            with gr.Tab("Live Log"):
+                gr.Markdown("Last 300 log lines, newest at the bottom. Refreshes automatically.")
+                log_box = gr.Textbox(
+                    value=LOG_RING.tail_text(), interactive=False, lines=24, max_lines=24,
+                    show_label=False, elem_id="gp-log",
+                )
+
+            # --- Autonomous mode config (read-only) ---------------------------
+            with gr.Tab("Automation"):
+                gr.Markdown(_automation_summary())
+
+        hunt_btn.click(run_autonomous_hunt, inputs=[niche_input, loc_input], outputs=[results_table])
 
         # IMPROVED: gr.Timer replaces the fragile demo.load(fn, every=N)
         # pattern, which raises a validation error on several recent Gradio
         # releases because `every` expects a Timer/None, not a bare int.
+        # A single timer now drives every live-updating panel on the page.
         refresh_timer = gr.Timer(5)
-        refresh_timer.tick(lambda: STATE.snapshot(), outputs=status_box)
+        refresh_timer.tick(
+            _status_card_values,
+            outputs=[status_card, emails_card, leads_card, pixel_card, errors_card, last_error_box],
+        )
+        refresh_timer.tick(_source_breakdown_df, outputs=source_table)
+        refresh_timer.tick(_health_text, outputs=health_box)
+        refresh_timer.tick(LOG_RING.tail_text, outputs=log_box)
+
+        demo.load(
+            _status_card_values,
+            outputs=[status_card, emails_card, leads_card, pixel_card, errors_card, last_error_box],
+        )
     return demo
 
 
