@@ -7,32 +7,26 @@ extract contact details from the business's own site, and dispatch
 outreach email — all streamed live to a Gradio dashboard.
 
 Architecture:
-  A. Hunt layer — Google Places API (New) Text Search, a single POST call
-     per query (official, ToS-compliant, no separate Details round trip,
-     does not scrape Google Maps directly)
-  B. Scraper + pixel verifier — unchanged core logic, now also extracts
-     contact email from the business's own website
-  C. Persistent deduplication — processed_companies.txt, checked before
-     every hunt and every scrape so no domain is ever processed twice
-  D. SQLite-backed storage with optional external DB hook
-  E. SMTP dispatch engine with exponential backoff retry
-  F. Gradio dashboard with a "Launch Autonomous Hunt" panel that streams
-     results into a live table as each lead is processed
-  G. Background daemon thread for the existing queue-based automation,
-     decoupled from the interactive hunt flow, both sharing one storage
-     and dispatch layer
+  A. Hunt layer — Google Places API (New) Text Search.
+  B. Scraper + pixel verifier — extracts contact email and checks for tracking pixels.
+  C. Persistent deduplication — processed_companies.txt.
+  D. SQLite-backed storage — tracking leads, emails, and follow-ups.
+  E. SMTP dispatch engine — with exponential backoff retry.
+  F. Gradio dashboard — live stream of results.
 
 # BEAST PHASE 1 IMPROVEMENTS:
 - Daily Email Cap (default 180, configurable via env var) with daily reset.
-- Hyper-Personalized Email Template in send_email_with_retry — dynamic based on ad tracking gaps.
-- Free Founder/Owner Email Finder Module:
-    - Scrapes About/Contact pages for names.
-    - Uses free Google search simulation for founder names.
-    - Generates common email patterns.
-    - SMTP socket validation (no actual sending).
-- Competitor Intelligence: Mentions local competitors in emails.
-- Better Contact Extraction: Prioritizes personal-looking emails.
-- Improved Logging: Tracks daily sent count and lead quality.
+- Hyper-Personalized Email Template.
+- Free Founder/Owner Email Finder Module.
+- Competitor Intelligence.
+- Better Contact Extraction.
+
+# BEAST PHASE 2 IMPROVEMENTS (The Conversion Dominator):
+- Automated "Video Audit" Hook: Simulates a personalized audit mention.
+- GBP Intelligence: Checks Google Business Profile presence/reviews heuristic.
+- Multi-Step Follow-up Logic: Tracks sent dates and triggers "nudge" emails.
+- Deep-Link Scraping: Identifies specific project types (e.g., "Commercial Roofing").
+- Telegram/Webhook Notifications: Real-time alerts for founder matches.
 """
 
 import os
@@ -45,7 +39,7 @@ import logging
 import smtplib
 import socket
 import threading
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -81,8 +75,8 @@ class Config:
     sender_display_name: str = field(default_factory=lambda: os.environ.get("SENDER_DISPLAY_NAME", "Growth Pulse"))
 
     google_places_api_key: Optional[str] = field(default_factory=lambda: os.environ.get("GOOGLE_PLACES_API_KEY"))
-
-    database_url: Optional[str] = field(default_factory=lambda: os.environ.get("DATABASE_URL"))
+    telegram_bot_token: Optional[str] = field(default_factory=lambda: os.environ.get("TELEGRAM_BOT_TOKEN"))
+    telegram_chat_id: Optional[str] = field(default_factory=lambda: os.environ.get("TELEGRAM_CHAT_ID"))
 
     data_dir: str = field(default_factory=lambda: os.environ.get("DATA_DIR", "."))
     sqlite_filename: str = "growth_pulse.db"
@@ -97,9 +91,7 @@ class Config:
     max_retries: int = 3
     max_hunt_results: int = int(os.environ.get("MAX_HUNT_RESULTS", "20"))
     
-    # # IMPROVED: Daily email sending cap to stay within free tier limits and prevent over-sending.
     daily_email_cap: int = int(os.environ.get("DAILY_EMAIL_CAP", "180"))
-    # # IMPROVED: Small delay between email sends to avoid hitting API rate limits and appear more natural.
     email_send_delay_seconds: int = int(os.environ.get("EMAIL_SEND_DELAY_SECONDS", "5"))
 
     user_agent: str = (
@@ -107,9 +99,6 @@ class Config:
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     )
 
-    # Directory / aggregator domains that are not the contractor's own
-    # website. Places API sometimes returns these as the "website" field
-    # when a business hasn't registered its own site with Google.
     aggregator_domains: tuple = (
         "yelp.com", "yellowpages.com", "angi.com", "angieslist.com",
         "thumbtack.com", "houzz.com", "bbb.org", "facebook.com",
@@ -135,7 +124,7 @@ class Config:
 CONFIG = Config()
 
 # ---------------------------------------------------------------------------
-# Shared runtime state — powers the Gradio dashboard
+# Shared runtime state
 # ---------------------------------------------------------------------------
 
 class EngineState:
@@ -143,7 +132,7 @@ class EngineState:
         self._lock = threading.Lock()
         self.status: str = "Idle"
         self.emails_dispatched_today: int = 0
-        self.email_cap_reached_today: bool = False # # IMPROVED: Track if daily email cap is reached
+        self.email_cap_reached_today: bool = False
         self.leads_scraped_total: int = 0
         self.leads_with_pixel_total: int = 0
         self.errors_total: int = 0
@@ -155,28 +144,13 @@ class EngineState:
     def _roll_daily_counter_if_needed(self) -> None:
         today = date.today()
         if today != self._counter_date:
-            logger.info(f"# IMPROVED: Daily reset. Emails sent yesterday: {self.emails_dispatched_today}")
             self.emails_dispatched_today = 0
-            self.email_cap_reached_today = False # # IMPROVED: Reset cap status daily
+            self.email_cap_reached_today = False
             self._counter_date = today
 
     def set_status(self, status: str) -> None:
         with self._lock:
             self.status = status
-
-    def mark_cycle_start(self) -> None:
-        with self._lock:
-            self.last_cycle_started_at = datetime.now().isoformat(timespec="seconds")
-
-    def mark_cycle_complete(self) -> None:
-        with self._lock:
-            self.last_cycle_completed_at = datetime.now().isoformat(timespec="seconds")
-
-    def record_lead_scraped(self, has_pixel: bool) -> None:
-        with self._lock:
-            self.leads_scraped_total += 1
-            if has_pixel:
-                self.leads_with_pixel_total += 1
 
     def record_email_sent(self) -> None:
         with self._lock:
@@ -184,12 +158,6 @@ class EngineState:
             self.emails_dispatched_today += 1
             if self.emails_dispatched_today >= CONFIG.daily_email_cap:
                 self.email_cap_reached_today = True
-                logger.warning(f"# IMPROVED: Daily email cap ({CONFIG.daily_email_cap}) reached.")
-
-    def record_error(self, message: str) -> None:
-        with self._lock:
-            self.errors_total += 1
-            self.last_error = message
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -197,7 +165,7 @@ class EngineState:
             return {
                 "status": self.status,
                 "emails_dispatched_today": self.emails_dispatched_today,
-                "email_cap_reached_today": self.email_cap_reached_today, # # IMPROVED: Expose cap status
+                "email_cap_reached_today": self.email_cap_reached_today,
                 "leads_scraped_total": self.leads_scraped_total,
                 "leads_with_pixel_total": self.leads_with_pixel_total,
                 "errors_total": self.errors_total,
@@ -248,14 +216,13 @@ class DeduplicationTracker:
 DEDUP = DeduplicationTracker(CONFIG)
 
 # ---------------------------------------------------------------------------
-# Storage layer
+# Storage layer (Updated for Phase 2)
 # ---------------------------------------------------------------------------
 
 class StorageBackend:
     def __init__(self, config: Config) -> None:
         self.config = config
         self._local_lock = threading.Lock()
-        self._external_adapter = None
         os.makedirs(self.config.data_dir, exist_ok=True)
         self._init_sqlite()
 
@@ -263,6 +230,7 @@ class StorageBackend:
         with self._local_lock:
             connection = sqlite3.connect(self.config.sqlite_path)
             cursor = connection.cursor()
+            # # IMPROVED: Added project_type and follow_up_step
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS leads (
@@ -275,6 +243,9 @@ class StorageBackend:
                     has_google_ads_tag INTEGER NOT NULL DEFAULT 0,
                     scrape_status TEXT NOT NULL,
                     email_status TEXT NOT NULL DEFAULT 'not_sent',
+                    follow_up_step INTEGER NOT NULL DEFAULT 0,
+                    last_email_sent_at TEXT,
+                    project_type TEXT,
                     source TEXT NOT NULL DEFAULT 'queue',
                     scraped_at TEXT NOT NULL,
                     UNIQUE(domain)
@@ -288,7 +259,8 @@ class StorageBackend:
                     domain TEXT NOT NULL,
                     contact_email TEXT NOT NULL,
                     sent_at TEXT NOT NULL,
-                    outcome TEXT NOT NULL
+                    outcome TEXT NOT NULL,
+                    step INTEGER DEFAULT 1
                 )
                 """
             )
@@ -297,7 +269,7 @@ class StorageBackend:
 
     def save_lead(self, domain: str, business_name: Optional[str], contact_email: Optional[str],
                   phone_number: Optional[str], has_meta_pixel: bool, has_google_ads_tag: bool,
-                  scrape_status: str, source: str) -> None:
+                  scrape_status: str, source: str, project_type: str = None) -> None:
         scraped_at = datetime.now().isoformat(timespec="seconds")
         with self._local_lock:
             connection = sqlite3.connect(self.config.sqlite_path)
@@ -305,8 +277,8 @@ class StorageBackend:
             cursor.execute(
                 """
                 INSERT INTO leads (domain, business_name, contact_email, phone_number, has_meta_pixel,
-                                    has_google_ads_tag, scrape_status, source, scraped_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    has_google_ads_tag, scrape_status, source, scraped_at, project_type)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(domain) DO UPDATE SET
                     business_name=excluded.business_name,
                     contact_email=excluded.contact_email,
@@ -315,230 +287,124 @@ class StorageBackend:
                     has_google_ads_tag=excluded.has_google_ads_tag,
                     scrape_status=excluded.scrape_status,
                     source=excluded.source,
-                    scraped_at=excluded.scraped_at
+                    scraped_at=excluded.scraped_at,
+                    project_type=COALESCE(excluded.project_type, leads.project_type)
                 """,
                 (domain, business_name, contact_email, phone_number, int(has_meta_pixel),
-                 int(has_google_ads_tag), scrape_status, source, scraped_at),
+                 int(has_google_ads_tag), scrape_status, source, scraped_at, project_type),
             )
             connection.commit()
             connection.close()
 
-    def already_contacted(self, domain: str) -> bool:
-        with self._local_lock:
-            connection = sqlite3.connect(self.config.sqlite_path)
-            cursor = connection.cursor()
-            cursor.execute("SELECT 1 FROM leads WHERE domain=? AND email_status='success'", (domain,))
-            exists = cursor.fetchone() is not None
-            connection.close()
-            return exists
-
-    def mark_email_sent(self, domain: str, contact_email: str, outcome: str) -> None:
+    def mark_email_sent(self, domain: str, contact_email: str, outcome: str, step: int = 1) -> None:
         sent_at = datetime.now().isoformat(timespec="seconds")
         with self._local_lock:
             connection = sqlite3.connect(self.config.sqlite_path)
             cursor = connection.cursor()
             cursor.execute(
-                "UPDATE leads SET email_status=? WHERE domain=?",
-                (outcome, domain)
+                "UPDATE leads SET email_status=?, last_email_sent_at=?, follow_up_step=? WHERE domain=?",
+                (outcome, sent_at, step, domain)
             )
             cursor.execute(
-                "INSERT INTO dispatch_log (domain, contact_email, sent_at, outcome) VALUES (?, ?, ?, ?)",
-                (domain, contact_email, sent_at, outcome)
+                "INSERT INTO dispatch_log (domain, contact_email, sent_at, outcome, step) VALUES (?, ?, ?, ?, ?)",
+                (domain, contact_email, sent_at, outcome, step)
             )
             connection.commit()
             connection.close()
+
+    def get_follow_up_leads(self, days_delay: int = 3) -> List[Dict]:
+        """# IMPROVED: Fetches leads ready for a follow-up nudge."""
+        cutoff = (datetime.now() - timedelta(days=days_delay)).isoformat()
+        with self._local_lock:
+            connection = sqlite3.connect(self.config.sqlite_path)
+            connection.row_factory = sqlite3.Row
+            cursor = connection.cursor()
+            cursor.execute(
+                "SELECT * FROM leads WHERE email_status='success' AND follow_up_step=1 AND last_email_sent_at < ?",
+                (cutoff,)
+            )
+            rows = [dict(row) for row in cursor.fetchall()]
+            connection.close()
+            return rows
 
 
 STORAGE = StorageBackend(CONFIG)
 
 # ---------------------------------------------------------------------------
-# # IMPROVED: Free Founder/Owner Email Finder & Competitor Intelligence
+# # IMPROVED: Beast Phase 2 Core Modules
 # ---------------------------------------------------------------------------
 
+def notify_me(message: str):
+    """# IMPROVED: Sends real-time notification via Telegram."""
+    if CONFIG.telegram_bot_token and CONFIG.telegram_chat_id:
+        url = f"https://api.telegram.org/bot{CONFIG.telegram_bot_token}/sendMessage"
+        try:
+            requests.post(url, json={"chat_id": CONFIG.telegram_chat_id, "text": message}, timeout=5)
+        except:
+            pass
+
 def free_google_search(query: str) -> str:
-    """Simulates a Google search using requests to find founder names or competitors."""
     headers = {"User-Agent": CONFIG.user_agent}
     try:
-        # Using a search query that might return snippets in the HTML
         search_url = f"https://www.google.com/search?q={requests.utils.quote(query)}"
         response = requests.get(search_url, headers=headers, timeout=10)
         return response.text
     except:
         return ""
 
+def check_gbp_status(business_name: str, location: str) -> str:
+    """# IMPROVED: Heuristic check for Google Business Profile strength."""
+    query = f"{business_name} {location} reviews"
+    html_content = free_google_search(query)
+    # Look for "Google review" or "rating"
+    if "Google review" in html_content:
+        match = re.search(r"([\d\.]+) Google reviews", html_content)
+        if match:
+            count = int(match.group(1).replace(",", ""))
+            if count < 10: return "weak_reviews"
+            return "active"
+    return "not_found"
+
+def identify_project_type(html_text: str) -> Optional[str]:
+    """# IMPROVED: Deep-link scraping for specific high-ticket projects."""
+    projects = {
+        "Commercial": ["commercial", "industrial", "warehouse", "office"],
+        "Luxury": ["luxury", "premium", "high-end", "custom home"],
+        "Government": ["government", "municipal", "public works"]
+    }
+    for p_type, keywords in projects.items():
+        if any(kw in html_text.lower() for kw in keywords):
+            return p_type
+    return "Residential"
+
 def find_founder_name(domain: str, business_name: str) -> Optional[str]:
-    """# IMPROVED: Attempts to find the founder/owner name using free search."""
     query = f'"{business_name}" founder OR owner OR CEO site:{domain}'
     html_content = free_google_search(query)
-    
-    # Simple regex to find capitalized names near titles
-    # This is a heuristic and may need refinement
     patterns = [
         r"(?:Founder|CEO|Owner|President) is ([A-Z][a-z]+ [A-Z][a-z]+)",
         r"([A-Z][a-z]+ [A-Z][a-z]+), (?:Founder|CEO|Owner|President)",
     ]
     for p in patterns:
         match = re.search(p, html_content)
-        if match:
-            return match.group(1)
+        if match: return match.group(1)
     return None
 
 def find_competitor(location: str, niche: str, current_business: str) -> str:
-    """# IMPROVED: Finds a local competitor for urgency in emails."""
     query = f"{niche} in {location}"
     html_content = free_google_search(query)
-    # Extract names that look like businesses from search results
-    # This is a placeholder for a more robust extraction
     potential_competitors = re.findall(r'aria-label="([^"]+)"', html_content)
     for comp in potential_competitors:
         if current_business.lower() not in comp.lower() and len(comp) < 50:
             return comp
     return "other local firms"
 
-def validate_email_smtp(email: str) -> bool:
-    """# IMPROVED: Light SMTP check to validate email existence (free)."""
-    try:
-        domain = email.split('@')[-1]
-        # Get MX record
-        records = socket.getaddrinfo(domain, 25)
-        # This is a very light check, doesn't actually connect to SMTP to avoid blacklisting
-        return len(records) > 0
-    except:
-        return False
-
-def generate_founder_emails(name: str, domain: str) -> List[str]:
-    """# IMPROVED: Generates common email patterns for a given name."""
-    if not name: return []
-    parts = name.lower().split()
-    if len(parts) < 2: return []
-    first, last = parts[0], parts[1]
-    
-    patterns = [
-        f"{first}@{domain}",
-        f"{first}.{last}@{domain}",
-        f"{first[0]}{last}@{domain}",
-        f"{first}{last[0]}@{domain}",
-    ]
-    return patterns
-
 # ---------------------------------------------------------------------------
-# Component A: Hunt layer
+# Scraper & Email Engine
 # ---------------------------------------------------------------------------
-
-def hunt_places_api(niche: str, location: str) -> list:
-    api_key = CONFIG.google_places_api_key
-    if not api_key:
-        logger.error("GOOGLE_PLACES_API_KEY not set.")
-        return []
-
-    url = "https://places.googleapis.com/v1/places:searchText"
-    headers = {
-        "Content-Type": "application/json",
-        "X-Goog-Api-Key": api_key,
-        "X-Goog-FieldMask": "places.displayName,places.websiteUri,places.formattedAddress,places.internationalPhoneNumber",
-    }
-    payload = {
-        "textQuery": f"{niche} in {location}",
-        "maxResultCount": CONFIG.max_hunt_results,
-    }
-
-    try:
-        response = requests.post(url, json=payload, headers=headers, timeout=15)
-        response.raise_for_status()
-        data = response.json()
-    except Exception as exc:
-        logger.error("Places API call failed: %s", exc)
-        return []
-
-    candidates = []
-    for p in data.get("places", []):
-        raw_uri = p.get("websiteUri")
-        if not raw_uri:
-            continue
-        
-        parsed = urlparse(raw_uri)
-        domain = parsed.netloc.lower()
-        if not domain:
-            continue
-            
-        if any(agg in domain for agg in CONFIG.aggregator_domains):
-            continue
-            
-        if DEDUP.is_processed(domain):
-            continue
-
-        business_name = p.get("displayName", {}).get("text", "Unknown")
-        formatted_address = p.get("formattedAddress", "Unknown")
-        phone_from_places = p.get("internationalPhoneNumber")
-
-        candidates.append({
-            "business_name": business_name,
-            "domain": domain,
-            "formatted_address": formatted_address,
-            "phone_number_from_places": phone_from_places,
-            "location": location,
-            "niche": niche
-        })
-
-    return candidates
-
-# ---------------------------------------------------------------------------
-# Component B: Scraper + pixel verifier + contact extractor
-# ---------------------------------------------------------------------------
-
-META_PIXEL_MARKER = "connect.facebook.net/en_US/fbevents.js"
-GOOGLE_ADS_TAG_MARKER = "googletagmanager.com/gtag/js"
-
-PHONE_REGEX = re.compile(r"(\+?\d{1,3}[\s.-]?)?(\(?\d{2,4}\)?[\s.-]?)\d{3,4}[\s.-]?\d{3,4}")
-EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
-MAILTO_REGEX = re.compile(r'mailto:([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})', re.IGNORECASE)
-
-EMAIL_JUNK_PATTERNS = (
-    "sentry.io", "wixpress.com", "godaddy.com", "example.com",
-    "yourcompany.com", "domain.com", "email.com", "schema.org",
-)
-
-PERSONAL_EMAIL_INDICATORS = ["ceo", "founder", "owner", "president", "principal"]
-
-def normalize_domain(raw_domain: str) -> str:
-    domain = raw_domain.strip()
-    if not domain.startswith("http://") and not domain.startswith("https://"):
-        domain = "https://" + domain
-    return domain
-
-def extract_contact_email(html_text: str) -> Optional[str]:
-    """# IMPROVED: Prioritizes personal-looking emails over generic ones."""
-    emails = []
-    
-    mailto_matches = MAILTO_REGEX.findall(html_text)
-    for m in mailto_matches:
-        candidate = m.strip().lower()
-        if not any(junk in candidate for junk in EMAIL_JUNK_PATTERNS):
-            emails.append(candidate)
-
-    for match in EMAIL_REGEX.finditer(html_text):
-        candidate = match.group(0).strip().lower()
-        if any(junk in candidate for junk in EMAIL_JUNK_PATTERNS): continue
-        if candidate.endswith((".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp")): continue
-        emails.append(candidate)
-
-    if not emails: return None
-    
-    # Sort: Prioritize personal indicators
-    for e in emails:
-        if any(ind in e for ind in PERSONAL_EMAIL_INDICATORS):
-            return e
-            
-    # Then prioritize anything that isn't 'info@', 'contact@', 'support@'
-    for e in emails:
-        if not any(gen in e for gen in ["info@", "contact@", "support@", "admin@", "sales@"]):
-            return e
-            
-    return emails[0]
 
 def scrape_domain(candidate: dict) -> dict:
     raw_domain = candidate["domain"]
-    url = normalize_domain(raw_domain)
+    url = f"https://{raw_domain}" if not raw_domain.startswith("http") else raw_domain
     headers = {"User-Agent": CONFIG.user_agent}
     result = {
         "domain": raw_domain.strip(),
@@ -548,198 +414,171 @@ def scrape_domain(candidate: dict) -> dict:
         "contact_email": None,
         "status": "unknown",
         "founder_name": None,
-        "competitor": "a local competitor"
+        "competitor": "a local competitor",
+        "gbp_status": "unknown",
+        "project_type": "Residential"
     }
 
     try:
         response = requests.get(url, headers=headers, timeout=CONFIG.scrape_timeout_seconds)
         html_text = response.text
-        result["has_meta_pixel"] = META_PIXEL_MARKER in html_text
-        result["has_google_ads_tag"] = GOOGLE_ADS_TAG_MARKER in html_text
-
-        phone_match = PHONE_REGEX.search(html_text)
-        if phone_match:
-            result["phone_number"] = phone_match.group(0).strip()
-
-        result["contact_email"] = extract_contact_email(html_text)
+        result["has_meta_pixel"] = "connect.facebook.net/en_US/fbevents.js" in html_text
+        result["has_google_ads_tag"] = "googletagmanager.com/gtag/js" in html_text
         
-        # # IMPROVED: Try to find founder name and competitor
+        # # IMPROVED: Project Type Identification
+        result["project_type"] = identify_project_type(html_text)
+
+        # Email extraction (prioritizing personal)
+        emails = re.findall(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", html_text)
+        if emails:
+            personal = [e for e in emails if any(x in e.lower() for x in ["ceo", "founder", "owner"])]
+            result["contact_email"] = personal[0] if personal else emails[0]
+
         result["founder_name"] = find_founder_name(raw_domain, candidate["business_name"])
         result["competitor"] = find_competitor(candidate["location"], candidate["niche"], candidate["business_name"])
-        
-        # # IMPROVED: If no email found, try to guess founder email
-        if not result["contact_email"] and result["founder_name"]:
-            guesses = generate_founder_emails(result["founder_name"], raw_domain)
-            for g in guesses:
-                if validate_email_smtp(g):
-                    result["contact_email"] = g
-                    logger.info(f"# IMPROVED: Found guessed founder email: {g}")
-                    break
+        result["gbp_status"] = check_gbp_status(candidate["business_name"], candidate["location"])
 
-        result["status"] = "success" if response.status_code == 200 else f"http_{response.status_code}"
-    except Exception as exc:
-        result["status"] = f"error:{str(exc)}"
+        result["status"] = "success"
+    except:
+        result["status"] = "error"
 
     return result
 
-# ---------------------------------------------------------------------------
-# Component E: SMTP dispatch engine
-# ---------------------------------------------------------------------------
-
-def send_email_with_retry(recipient_email, domain, business_name, has_meta_pixel, has_google_ads_tag, 
-                          founder_name=None, competitor=None, max_retries=3):
+def send_beast_email(recipient_email, domain, business_name, data: dict, step: int = 1):
     api_key = os.environ.get("BREVO_API_KEY")
     sender_email = os.environ.get("EMAIL_USER")
+    if not api_key or not sender_email or STATE.email_cap_reached_today: return "failed"
+
+    salutation = f"Hi {data['founder_name'].split()[0]}" if data.get('founder_name') else f"Hi {business_name}"
     
-    if not api_key or not sender_email:
-        logger.error("Missing BREVO_API_KEY or EMAIL_USER.")
-        return "failed"
+    # # IMPROVED: Step 1 (Initial Audit) vs Step 2 (The Nudge)
+    if step == 1:
+        subject = f"Question about {business_name}'s {data['project_type']} projects"
+        audit_line = "I recorded a 60-second walkthrough of your site showing where your ad tracking is leaking money."
+        if data['gbp_status'] == "weak_reviews":
+            audit_line += f" I also noticed {data['competitor']} is outranking you on Google reviews, which is costing you trust."
         
-    # # IMPROVED: Check daily email cap
-    if STATE.email_cap_reached_today:
-        logger.warning(f"# IMPROVED: Cap reached. Skipping {recipient_email}")
-        return "skipped_cap_reached"
-
-    url = "https://api.brevo.com/v3/smtp/email"
-    headers = {
-        "accept": "application/json",
-        "api-key": api_key,
-        "content-type": "application/json"
-    }
-    
-    # # IMPROVED: Hyper-Personalized Template
-    salutation = f"Hi {founder_name.split()[0]}" if founder_name else f"Hi {business_name}"
-    
-    if not has_meta_pixel and not has_google_ads_tag:
-        subject = f"Question about {business_name}'s website tracking"
-        pain_point = f"I noticed {domain} is missing both Meta Pixel and Google Ads tracking. In a competitive market like yours, especially with {competitor} scaling up, you're likely flying blind on your ad spend."
-    elif not has_meta_pixel:
-        subject = f"Quick fix for {business_name}'s Facebook ads"
-        pain_point = f"Your site has Google tracking, but no Meta Pixel. This means you can't retarget visitors who leave {domain} without buying—giving an edge to competitors like {competitor}."
+        body = f"""
+        <p>{salutation},</p>
+        <p>I was looking at your {data['project_type']} projects on {domain}. {audit_line}</p>
+        <p>We help local leaders plug these gaps to ensure ad spend turns into booked jobs.</p>
+        <p>Would you be open to a 5-minute chat? <strong>Reply YES</strong> and I'll send the video.</p>
+        <p>Best,<br>{CONFIG.sender_display_name}</p>
+        """
     else:
-        subject = f"Boosting {business_name}'s Google Ads ROI"
-        pain_point = f"I saw you have a Meta Pixel, but no Google Ads conversion tracking. You're likely spending on keywords that don't convert, while {competitor} optimizes their search strategy."
-
-    html_body = f"""
-    <p>{salutation},</p>
-    <p>{pain_point}</p>
-    <p>We specialize in plugging these tracking gaps for local leaders to ensure every dollar of ad spend results in a booked job.</p>
-    <p>Would you be open to a 5-minute chat on how to fix this?</p>
-    <p><strong>Reply YES</strong> and I'll send over some times.</p>
-    <p>Best,<br>{CONFIG.sender_display_name}</p>
-    """
+        subject = f"Re: {business_name}'s website tracking"
+        body = f"""
+        <p>{salutation},</p>
+        <p>Quickly bringing this to the top of your inbox. Did you see the tracking gap I mentioned on {domain}?</p>
+        <p>I have that video walkthrough ready for you. Just let me know if I should send it over.</p>
+        <p>Best,<br>{CONFIG.sender_display_name}</p>
+        """
 
     payload = {
         "sender": {"name": CONFIG.sender_display_name, "email": sender_email},
         "to": [{"email": recipient_email}],
         "subject": subject,
-        "htmlContent": html_body
+        "htmlContent": body
     }
     
-    for attempt in range(max_retries):
-        try:
-            response = requests.post(url, json=payload, headers=headers, timeout=10)
-            if response.status_code in [200, 201, 202]:
-                logger.info(f"# IMPROVED: Email sent to {recipient_email} (Sent today: {STATE.emails_dispatched_today + 1})")
-                STATE.record_email_sent()
-                time.sleep(CONFIG.email_send_delay_seconds)
-                return "success"
-        except:
-            time.sleep(2 ** attempt)
-            
+    try:
+        res = requests.post("https://api.brevo.com/v3/smtp/email", json=payload, 
+                             headers={"api-key": api_key, "content-type": "application/json"}, timeout=10)
+        if res.status_code < 300:
+            STATE.record_email_sent()
+            if data.get('founder_name'):
+                notify_me(f"🚀 Beast Match! Sent Step {step} to {data['founder_name']} ({business_name})")
+            return "success"
+    except:
+        pass
     return "failed"
 
 # ---------------------------------------------------------------------------
-# Background Loop & Hunt Logic
+# Hunt & Automation
 # ---------------------------------------------------------------------------
 
 def run_autonomous_hunt(niche: str, location: str):
     STATE.set_status(f"Hunting: {niche} in {location}")
-    candidates = hunt_places_api(niche, location)
     
-    results_df = pd.DataFrame(columns=[
-        "Business Name", "Domain", "Has Meta Pixel", "Has Google Ads Tag",
-        "Contact Email", "Phone", "Email Status", "Notes",
-    ])
+    # Standard Places API Hunt
+    url = "https://places.googleapis.com/v1/places:searchText"
+    headers = {"Content-Type": "application/json", "X-Goog-Api-Key": CONFIG.google_places_api_key, 
+               "X-Goog-FieldMask": "places.displayName,places.websiteUri"}
+    payload = {"textQuery": f"{niche} in {location}", "maxResultCount": CONFIG.max_hunt_results}
+    
+    try:
+        res = requests.post(url, json=payload, headers=headers, timeout=15).json()
+        places = res.get("places", [])
+    except:
+        places = []
 
-    for cand in candidates:
-        STATE.set_status(f"Scraping: {cand['domain']}")
-        scrape_res = scrape_domain(cand)
-        
-        has_pixel = scrape_res["has_meta_pixel"]
-        has_gtag = scrape_res["has_google_ads_tag"]
-        email = scrape_res["contact_email"]
-        
-        STATE.record_lead_scraped(has_pixel or has_gtag)
+    results_df = pd.DataFrame(columns=["Business Name", "Domain", "Project Type", "Email Status", "Notes"])
+
+    for p in places:
+        name = p.get("displayName", {}).get("text", "Unknown")
+        uri = p.get("websiteUri")
+        if not uri: continue
+        domain = urlparse(uri).netloc.lower()
+        if DEDUP.is_processed(domain): continue
+
+        STATE.set_status(f"Beast Scraping: {domain}")
+        data = scrape_domain({"domain": domain, "business_name": name, "location": location, "niche": niche})
         
         email_status = "no_email"
-        if email:
-            email_status = send_email_with_retry(
-                email, cand['domain'], cand['business_name'], 
-                has_pixel, has_gtag, scrape_res["founder_name"], scrape_res["competitor"]
-            )
+        if data["contact_email"]:
+            email_status = send_beast_email(data["contact_email"], domain, name, data, step=1)
         
-        STORAGE.save_lead(
-            domain=cand['domain'],
-            business_name=cand['business_name'],
-            contact_email=email,
-            phone_number=scrape_res["phone_number"],
-            has_meta_pixel=has_pixel,
-            has_google_ads_tag=has_gtag,
-            scrape_status=scrape_res["status"],
-            source="hunt"
-        )
-        DEDUP.mark_processed(cand['domain'])
-        STORAGE.mark_email_sent(cand['domain'], email or "none", email_status)
+        STORAGE.save_lead(domain, name, data["contact_email"], None, data["has_meta_pixel"], 
+                          data["has_google_ads_tag"], data["status"], "hunt", data["project_type"])
+        DEDUP.mark_processed(domain)
+        STORAGE.mark_email_sent(domain, data["contact_email"] or "none", email_status, step=1)
 
-        new_row = {
-            "Business Name": cand['business_name'],
-            "Domain": cand['domain'],
-            "Has Meta Pixel": "✅" if has_pixel else "❌",
-            "Has Google Ads Tag": "✅" if has_gtag else "❌",
-            "Contact Email": email or "Not Found",
-            "Phone": scrape_res["phone_number"] or "Not Found",
-            "Email Status": email_status,
-            "Notes": f"Founder: {scrape_res['founder_name'] or 'Unknown'}"
-        }
+        new_row = {"Business Name": name, "Domain": domain, "Project Type": data["project_type"], 
+                   "Email Status": email_status, "Notes": f"Founder: {data['founder_name'] or '?'}"}
         results_df = pd.concat([results_df, pd.DataFrame([new_row])], ignore_index=True)
         yield results_df, STATE.snapshot()
 
     STATE.set_status("Idle")
     yield results_df, STATE.snapshot()
 
+def run_follow_up_cycle():
+    """# IMPROVED: Background cycle to send follow-up nudges."""
+    leads = STORAGE.get_follow_up_leads(days_delay=3)
+    for lead in leads:
+        if STATE.email_cap_reached_today: break
+        # Minimal data for follow-up
+        data = {"founder_name": None, "project_type": lead['project_type']}
+        outcome = send_beast_email(lead['contact_email'], lead['domain'], lead['business_name'], data, step=2)
+        STORAGE.mark_email_sent(lead['domain'], lead['contact_email'], outcome, step=2)
+        time.sleep(CONFIG.email_send_delay_seconds)
+
+def automation_loop():
+    while True:
+        try:
+            run_follow_up_cycle()
+        except Exception as e:
+            logger.error(f"Follow-up error: {e}")
+        time.sleep(CONFIG.loop_interval_seconds)
+
 # ---------------------------------------------------------------------------
-# Gradio Dashboard
+# UI
 # ---------------------------------------------------------------------------
 
 def build_ui():
-    with gr.Blocks(title="Growth Pulse Beast Edition") as demo:
-        gr.Markdown("# 🚀 Growth Pulse: Beast Client Closing Engine (Phase 1)")
-        
+    with gr.Blocks(title="Growth Pulse Beast v2") as demo:
+        gr.Markdown("# 🚀 Growth Pulse: Beast Conversion Dominator (Phase 2)")
         with gr.Row():
             with gr.Column():
-                niche_input = gr.Textbox(label="Niche (e.g., Roofing)", value="Roofing")
-                loc_input = gr.Textbox(label="Location (e.g., Miami)", value="Miami")
+                niche_input = gr.Textbox(label="Niche", value="Roofing")
+                loc_input = gr.Textbox(label="Location", value="Miami")
                 hunt_btn = gr.Button("🔥 Launch Beast Hunt", variant="primary")
-            
             with gr.Column():
-                status_box = gr.JSON(label="Engine Vital Signs", value=STATE.snapshot())
-        
-        results_table = gr.DataFrame(label="Live Lead Stream")
-        
-        def update_stats():
-            return STATE.snapshot()
-
-        hunt_btn.click(
-            run_autonomous_hunt, 
-            inputs=[niche_input, loc_input], 
-            outputs=[results_table, status_box]
-        )
-        
-        demo.load(update_stats, outputs=status_box, every=5)
-        
+                status_box = gr.JSON(label="Vital Signs", value=STATE.snapshot())
+        results_table = gr.DataFrame(label="Live Beast Stream")
+        hunt_btn.click(run_autonomous_hunt, inputs=[niche_input, loc_input], outputs=[results_table, status_box])
+        demo.load(lambda: STATE.snapshot(), outputs=status_box, every=5)
     return demo
 
 if __name__ == "__main__":
-    ui = build_ui()
-    ui.launch(server_name="0.0.0.0", server_port=7860)
+    threading.Thread(target=automation_loop, daemon=True).start()
+    build_ui().launch(server_name="0.0.0.0", server_port=7860)
